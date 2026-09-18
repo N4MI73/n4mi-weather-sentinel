@@ -1,0 +1,1 @@
+PlatformIO project for the CoreS3 SE. Not yet scaffolded.
