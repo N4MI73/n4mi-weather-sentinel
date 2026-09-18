@@ -1,0 +1,25 @@
+# PlatformIO build output (firmware/.pio/) -- large, regenerated on every build
+.pio/
+
+# Wi-Fi credentials -- real values never committed; see
+# firmware/src/wifi_credentials.h.example for the template
+firmware/src/wifi_credentials.h
+
+# Editor clutter
+.vscode/
+*.code-workspace
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# --- Server phase (not yet built, added now per project guardrails) ---
+# Python virtual environments and caches
+venv/
+__pycache__/
+*.pyc
+
+# Secrets -- Tempest token, any future credentials -- these live in
+# Portainer environment variables only, never in a committed file
+.env
+*.env
