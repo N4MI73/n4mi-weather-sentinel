@@ -1,19 +1,18 @@
-// Weather Sentinel — Navigation demo (static data, no server yet).
+// Weather Sentinel — Navigation + secondary-page content (static/dummy
+// data, no server yet).
 //
 // 5 pages in a tap-to-advance cycle: Now, Wind & Rain, Lightning,
 // NWS Alerts, Status. Settings is reached only by long-press (~1s) from
 // any page, NOT part of the tap cycle. Auto-returns to Now after 45s
 // idle on any other page. A persistent, condensed alert strip is docked
 // at the bottom of every page except Now (which keeps its own existing
-// full-detail footer/banner, already approved).
+// full-detail footer/banner, already approved) and Settings.
 //
-// The four secondary pages (Wind & Rain, Lightning, NWS Alerts, Status)
-// are intentionally placeholders here -- per project convention, a new
-// screen's real layout needs its own SVG mockup and approval before full
-// implementation. This file validates the navigation MECHANISM only:
-// tap-to-advance, long-press-for-settings, idle timeout, persistent
-// alert awareness. Content design for each page is separate follow-up
-// work.
+// Navigation mechanism (tap-cycle, long-press, idle timeout, persistent
+// strip) is CONFIRMED WORKING on real hardware. The four secondary pages
+// now have real content matching their approved mockups -- still using
+// hardcoded/dummy values (no server exists yet), but the actual layouts
+// Dan approved rather than placeholders.
 
 #include <M5Unified.h>
 
@@ -45,7 +44,8 @@ static unsigned long lastActivityTime = 0;
 static uint16_t COLOR_BG, COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY, COLOR_TEXT_DIM,
     COLOR_SEPARATOR, COLOR_NWS_CLEAR_DOT, COLOR_NWS_CLEAR_TEXT,
     COLOR_LIGHTNING_BG, COLOR_LIGHTNING_BORDER, COLOR_LIGHTNING_TEXT,
-    COLOR_WARNING_BG, COLOR_WARNING_TEXT_HEADLINE, COLOR_WARNING_TEXT_DETAIL;
+    COLOR_WARNING_BG, COLOR_WARNING_TEXT_HEADLINE, COLOR_WARNING_TEXT_DETAIL,
+    COLOR_LABEL;
 
 void initColors() {
   COLOR_BG               = M5.Display.color565(0x04, 0x04, 0x04);
@@ -61,6 +61,7 @@ void initColors() {
   COLOR_WARNING_BG       = M5.Display.color565(0x5c, 0x0e, 0x0e);
   COLOR_WARNING_TEXT_HEADLINE = M5.Display.color565(0xff, 0xb3, 0xb3);
   COLOR_WARNING_TEXT_DETAIL   = M5.Display.color565(0xe0, 0x8a, 0x8a);
+  COLOR_LABEL             = M5.Display.color565(0x6a, 0x6a, 0x6a);
 }
 
 // ---- Now screen (unchanged from the approved design) ----
@@ -183,19 +184,196 @@ void drawPersistentStrip() {
   M5.Display.drawString(msg, 12, stripY + stripH / 2);
 }
 
-// ---- Secondary pages: navigation placeholders only ----
-// Real content/layout for each of these needs its own mockup + approval
-// before full implementation -- this just proves tap-cycling reaches them.
+// ---- Secondary pages: real content, matching approved mockups ----
+// Settings has no approved mockup yet, so it stays a placeholder.
 
-void drawPlaceholderPage(const char *title) {
+// Shared header for all four secondary pages: title + 5-dot page-position
+// indicator (matches every approved mockup). pageIndex is 0-based across
+// all 5 cycle pages (Now=0), so the dot for pageIndex lights up.
+void drawSecondaryHeader(const char *title, int pageIndex) {
   M5.Display.fillScreen(COLOR_BG);
   M5.Display.setTextDatum(top_left);
-  M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
-  M5.Display.setTextSize(1);
-  M5.Display.drawString("placeholder -- layout pending", 16, 8);
   M5.Display.setTextColor(COLOR_TEXT_PRIMARY, COLOR_BG);
   M5.Display.setTextSize(3);
-  M5.Display.drawString(title, 16, 90);
+  M5.Display.drawString(title, 16, 10);
+
+  int dotX[5] = {240, 254, 268, 282, 296};
+  for (int i = 0; i < 5; i++) {
+    if (i == pageIndex) {
+      M5.Display.fillCircle(dotX[i], 20, 3, COLOR_TEXT_PRIMARY);
+    } else {
+      M5.Display.fillCircle(dotX[i], 20, 3, COLOR_TEXT_DIM);
+    }
+  }
+
+  M5.Display.drawFastHLine(16, 38, 288, COLOR_SEPARATOR);
+}
+
+void drawWindRainPage() {
+  drawSecondaryHeader("Wind & Rain", PAGE_WIND_RAIN);
+
+  M5.Display.setTextDatum(top_left);
+
+  // Row 1: Wind + Gust
+  M5.Display.setTextColor(COLOR_LABEL, COLOR_BG);
+  M5.Display.setTextSize(1);
+  M5.Display.drawString("WIND (NW)", 16, 48);
+  M5.Display.drawString("GUST", 170, 48);
+
+  M5.Display.setTextColor(COLOR_TEXT_PRIMARY, COLOR_BG);
+  M5.Display.setTextSize(3);
+  M5.Display.drawString("6 mph", 16, 64);
+  M5.Display.drawString("14 mph", 170, 64);
+
+  M5.Display.drawFastHLine(16, 100, 288, COLOR_SEPARATOR);
+
+  // Row 2: Rain today + Rain rate
+  M5.Display.setTextColor(COLOR_LABEL, COLOR_BG);
+  M5.Display.setTextSize(1);
+  M5.Display.drawString("RAIN TODAY", 16, 110);
+  M5.Display.drawString("RAIN RATE", 170, 110);
+
+  M5.Display.setTextColor(COLOR_TEXT_PRIMARY, COLOR_BG);
+  M5.Display.setTextSize(3);
+  M5.Display.drawString("0.02\"", 16, 126);
+  M5.Display.drawString("0.00\"/hr", 170, 126);
+
+  M5.Display.drawFastHLine(16, 162, 288, COLOR_SEPARATOR);
+
+  // Row 3: Pressure + trend
+  M5.Display.setTextColor(COLOR_LABEL, COLOR_BG);
+  M5.Display.setTextSize(1);
+  M5.Display.drawString("PRESSURE", 16, 172);
+
+  M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
+  M5.Display.setTextSize(2);
+  M5.Display.drawString("29.91 inHg", 16, 188);
+  M5.Display.setTextColor(COLOR_NWS_CLEAR_TEXT, COLOR_BG);
+  M5.Display.drawString("Falling", 190, 188);
+}
+
+void drawLightningPage() {
+  drawSecondaryHeader("Lightning", PAGE_LIGHTNING);
+
+  // Status badge -- same amber palette as the Now-screen banner.
+  // Fixed height (50px) regardless of which classification text is
+  // active, so the rest of the page doesn't shift between states.
+  // "Frequent lightning nearby" doesn't fit on one line at size 2
+  // (confirmed on real hardware -- it ran past the box edge), so long
+  // text splits onto two lines; short text ("Lightning nearby") just
+  // uses the first line and leaves the second blank.
+  M5.Display.fillRoundRect(16, 48, 288, 50, 6, COLOR_LIGHTNING_BG);
+  M5.Display.drawRoundRect(16, 48, 288, 50, 6, COLOR_LIGHTNING_BORDER);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(COLOR_LIGHTNING_TEXT, COLOR_LIGHTNING_BG);
+  M5.Display.setTextSize(2);
+  M5.Display.drawString("Frequent lightning", 26, 56);
+  M5.Display.drawString("nearby", 26, 76);
+
+  // Closest recent strike
+  M5.Display.setTextColor(COLOR_LABEL, COLOR_BG);
+  M5.Display.setTextSize(1);
+  M5.Display.drawString("CLOSEST RECENT STRIKE", 16, 108);
+
+  M5.Display.setTextColor(COLOR_TEXT_PRIMARY, COLOR_BG);
+  M5.Display.setTextSize(3);
+  M5.Display.drawString("2.3 mi", 16, 124);
+  M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
+  M5.Display.setTextSize(2);
+  M5.Display.drawString("40 sec ago", 130, 130);
+
+  M5.Display.drawFastHLine(16, 162, 288, COLOR_SEPARATOR);
+
+  // Activity count in filtered window
+  M5.Display.setTextColor(COLOR_LABEL, COLOR_BG);
+  M5.Display.setTextSize(1);
+  M5.Display.drawString("ACTIVITY (LAST 10 MIN, WITHIN 10 MI)", 16, 172);
+
+  M5.Display.setTextColor(COLOR_TEXT_PRIMARY, COLOR_BG);
+  M5.Display.setTextSize(2);
+  M5.Display.drawString("6 strikes", 16, 188);
+}
+
+void drawNwsAlertsPage() {
+  drawSecondaryHeader("NWS Alerts", PAGE_NWS_ALERTS);
+
+  // Consolidated event + until block (v2 layout -- headline field
+  // deliberately dropped in favor of more room for instruction text;
+  // see project brief for the reasoning Dan approved).
+  M5.Display.fillRect(16, 48, 288, 34, COLOR_WARNING_BG);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(COLOR_WARNING_TEXT_HEADLINE, COLOR_WARNING_BG);
+  M5.Display.setTextSize(2);
+  M5.Display.drawString("SEVERE T-STORM WARNING", 24, 54);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(COLOR_WARNING_TEXT_DETAIL, COLOR_WARNING_BG);
+  M5.Display.drawString("Until 11:45 PM", 24, 72);
+
+  // Instruction: full official text -- up to ~6 lines fit before the
+  // persistent strip. Longer text than this needs a truncation
+  // indicator (not yet implemented -- flagged as a real gap below).
+  M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+  M5.Display.setTextSize(1);
+  M5.Display.drawString("INSTRUCTION", 16, 92);
+
+  const char *instructionLines[] = {
+    "Torrential rainfall is occurring with this",
+    "storm and may lead to flash flooding.",
+    "Persons in low-lying areas should move to",
+    "higher ground now. Do not walk or drive",
+    "into flooded areas. Turn around, don't",
+    "drown."
+  };
+  M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
+  M5.Display.setTextSize(2);
+  int y = 106;
+  for (int i = 0; i < 6; i++) {
+    M5.Display.drawString(instructionLines[i], 16, y);
+    y += 16;
+  }
+  // NOTE: this loop does not check whether a real, longer instruction
+  // string would overflow past y=214 (the persistent strip). Truncation
+  // logic is a known gap -- do not wire real NWS text into this without
+  // adding a length/line-count guard first.
+}
+
+void drawStatusPage() {
+  drawSecondaryHeader("Status", PAGE_STATUS);
+
+  M5.Display.setTextDatum(top_left);
+
+  struct StatusRow { const char *label; const char *value; uint16_t dotColor; };
+  StatusRow rows[4] = {
+    {"Wi-Fi",      "Connected (-58 dBm)", COLOR_NWS_CLEAR_DOT},
+    {"Backend",    "Reachable",           COLOR_NWS_CLEAR_DOT},
+    {"Last sync",  "1 min ago",           COLOR_NWS_CLEAR_DOT},
+    {"Time sync",  "OK (NTP)",            COLOR_NWS_CLEAR_DOT},
+  };
+
+  int y = 52;
+  for (int i = 0; i < 4; i++) {
+    M5.Display.fillCircle(24, y + 6, 5, rows[i].dotColor);
+    M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
+    M5.Display.setTextSize(2);
+    M5.Display.drawString(rows[i].label, 40, y);
+    M5.Display.setTextDatum(top_right);
+    M5.Display.drawString(rows[i].value, 304, y);
+    M5.Display.setTextDatum(top_left);
+    y += 28;
+  }
+
+  M5.Display.drawFastHLine(16, y + 4, 288, COLOR_SEPARATOR);
+  y += 16;
+
+  M5.Display.setTextColor(COLOR_LABEL, COLOR_BG);
+  M5.Display.setTextSize(1);
+  M5.Display.drawString("UPTIME", 16, y);
+  M5.Display.drawString("FIRMWARE", 170, y);
+
+  M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
+  M5.Display.setTextSize(2);
+  M5.Display.drawString("3d 4h 12m", 16, y + 16);
+  M5.Display.drawString("v0.1.0-dev", 170, y + 16);
 }
 
 void drawSettingsPage() {
@@ -218,16 +396,16 @@ void renderPage(Page p) {
       drawNowPage();
       return;  // Now keeps its own full footer; no persistent strip added
     case PAGE_WIND_RAIN:
-      drawPlaceholderPage("Wind & Rain");
+      drawWindRainPage();
       break;
     case PAGE_LIGHTNING:
-      drawPlaceholderPage("Lightning");
+      drawLightningPage();
       break;
     case PAGE_NWS_ALERTS:
-      drawPlaceholderPage("NWS Alerts");
+      drawNwsAlertsPage();
       break;
     case PAGE_STATUS:
-      drawPlaceholderPage("Status");
+      drawStatusPage();
       break;
     case PAGE_SETTINGS:
       drawSettingsPage();
