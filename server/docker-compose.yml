@@ -17,6 +17,13 @@
 # since Portainer otherwise attempts a pull step first (which fails, as
 # no pre-built image exists under this name) before ever reaching the
 # build step.
+#
+# The volume mount below is new (persistence across restarts): without
+# it, alert acknowledgement state lives only inside the container's own
+# filesystem, which is wiped on every redeploy, not just a restart --
+# same reasoning as WeeWX's own /volume2/docker/weewx/data mount.
+# Create /volume2/docker/weather-sentinel/data on the NAS (via File
+# Station) before deploying this if it doesn't already exist.
 
 services:
   weather-sentinel-server:
@@ -25,5 +32,7 @@ services:
     restart: unless-stopped
     network_mode: host
     pull_policy: build
+    volumes:
+      - /volume2/docker/weather-sentinel/data:/data
     environment:
       - NWS_CONTACT_INFO=${NWS_CONTACT_INFO}

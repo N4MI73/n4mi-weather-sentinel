@@ -67,6 +67,16 @@ NWS_HEADERS = {
 NWS_POLL_INTERVAL_SEC = 300  # 5 minutes -- matches Personal Portal's
                               # already-established NWS cache interval
 
+# Persistence: NWS alert lifecycle state only (IDs, ack state, and
+# enough content to correctly classify the next poll as "unchanged"
+# rather than "new"). Deliberately NOT covering lightning's rolling
+# strike window -- losing that on a restart is minor and self-healing
+# within one window's length, unlike every NWS alert wrongly re-sounding
+# as brand new, which is the actual guardrail this exists for.
+ALERTS_PERSISTENCE_PATH = os.environ.get(
+    "ALERTS_PERSISTENCE_PATH", "/data/alerts_state.json"
+)
+
 MS_TO_MPH = 2.23694
 
 
@@ -338,6 +348,36 @@ def process_nws_alerts_locked(raw_props_list):
         del tracked_alerts[aid]
 
 
+def load_persisted_alerts():
+    """Load tracked_alerts from disk at startup, if a persisted file
+    exists. A missing file (first-ever run, or a fresh volume) or any
+    read/parse problem is treated as "nothing to load" rather than a
+    fatal error -- the server should still start and just begin
+    tracking fresh, same as it always has."""
+    try:
+        with open(ALERTS_PERSISTENCE_PATH, "r") as f:
+            loaded = json.load(f)
+        with state_lock:
+            tracked_alerts.clear()
+            tracked_alerts.update(loaded)
+        print(f"[persistence] Loaded {len(loaded)} tracked alert(s) from {ALERTS_PERSISTENCE_PATH}")
+    except FileNotFoundError:
+        print(f"[persistence] No existing state file at {ALERTS_PERSISTENCE_PATH} -- starting fresh")
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[persistence] Could not load state from {ALERTS_PERSISTENCE_PATH}: {e} -- starting fresh")
+
+
+def save_persisted_alerts_locked():
+    """Write the current tracked_alerts to disk. Caller must already
+    hold state_lock. A write failure is logged, not fatal -- losing the
+    ability to persist shouldn't crash an otherwise-working server."""
+    try:
+        with open(ALERTS_PERSISTENCE_PATH, "w") as f:
+            json.dump(tracked_alerts, f)
+    except OSError as e:
+        print(f"[persistence] Failed to save state to {ALERTS_PERSISTENCE_PATH}: {e}")
+
+
 def poll_nws_once():
     try:
         response = requests.get(NWS_URL, headers=NWS_HEADERS, timeout=10)
@@ -350,6 +390,7 @@ def poll_nws_once():
             latest_nws["available"] = True
             latest_nws["last_polled_at"] = datetime.now(timezone.utc).isoformat()
             process_nws_alerts_locked(raw_props_list)
+            save_persisted_alerts_locked()
 
         print(f"[nws] Poll succeeded -- {len(raw_props_list)} active alert(s) from NWS")
 
@@ -453,6 +494,7 @@ def api_ack_alert():
         if alert_id not in tracked_alerts:
             return jsonify({"error": "unknown alert id"}), 404
         tracked_alerts[alert_id]["acknowledged"] = True
+        save_persisted_alerts_locked()
 
     return jsonify({"status": "ok", "id": alert_id})
 
@@ -463,6 +505,8 @@ def healthz():
 
 
 if __name__ == "__main__":
+    load_persisted_alerts()
+
     listener = threading.Thread(target=udp_listener_thread, daemon=True)
     listener.start()
 
