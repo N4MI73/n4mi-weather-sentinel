@@ -1,0 +1,29 @@
+# Weather Sentinel — server stack, deployed via Portainer's "Repository"
+# build method (same pattern as propmon and poolmon — Portainer builds
+# the image from this repo's Dockerfile rather than pulling a pre-built
+# one).
+#
+# network_mode: host is required, not optional — the UDP listener needs
+# to receive the Tempest hub's local broadcast, and a container on
+# Docker's default bridge network would silently receive nothing. This
+# is the exact same reason WeeWX's own container needs host networking.
+# Because of this, there's no `ports:` section below -- with host
+# networking, the Flask app's own bind to 0.0.0.0:8085 becomes directly
+# reachable at the NAS's IP on port 8085, no port mapping needed (same
+# pattern as WeeWX showing no mapped port in its own stack).
+#
+# pull_policy: build is set proactively -- poolmon's own recovery notes
+# document that Portainer's "Pull and redeploy" fails without this,
+# since Portainer otherwise attempts a pull step first (which fails, as
+# no pre-built image exists under this name) before ever reaching the
+# build step.
+
+services:
+  weather-sentinel-server:
+    build: .
+    container_name: weather-sentinel-server
+    restart: unless-stopped
+    network_mode: host
+    pull_policy: build
+    environment:
+      - NWS_CONTACT_INFO=${NWS_CONTACT_INFO}
