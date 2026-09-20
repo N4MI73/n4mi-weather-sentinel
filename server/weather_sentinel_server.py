@@ -8,10 +8,9 @@ nws_alert_test.py) into one long-running service with an HTTP endpoint,
 so the device will eventually be able to fetch current conditions and
 alert status over the network.
 
-STATUS: general conditions + raw active-alert polling. NOT yet included
-(each a separate, deliberately deferred next step):
-  - Lightning 10-mile filtering + heavy/sporadic classification
-    (this file stores only the single most recent raw strike, unfiltered)
+STATUS: general conditions + raw active-alert polling + lightning
+10-mile filter/classification. NOT yet included (each a separate,
+deliberately deferred next step):
   - Daily rain accumulation, pressure trend, feels-like temperature,
     sea-level pressure adjustment (all deferred earlier)
   - Alert LIFECYCLE tracking (new/updated/escalated/canceled/expired,
@@ -19,6 +18,11 @@ STATUS: general conditions + raw active-alert polling. NOT yet included
     list every poll, with no memory of what changed since last time
   - Persistence across restarts
   - Distance/geographic filtering beyond the single fixed zone (GAC073)
+
+Lightning classification (LIGHTNING_WINDOW_MINUTES,
+LIGHTNING_FREQUENT_THRESHOLD near the top of this file) uses PLACEHOLDER
+values, not calibrated ones -- these need Dan's own bench-testing once
+real storms exist to test against.
 
 Environment variables:
     NWS_CONTACT_INFO  Required before NWS polling will run. Format:
@@ -43,8 +47,8 @@ import socket
 import json
 import time
 import threading
-from datetime import datetime, timezone
-from flask import Flask, jsonify
+from datetime import datetime, timezone, timedelta
+from flask import Flask, jsonify, request
 import requests
 
 UDP_PORT = 50222
@@ -103,23 +107,35 @@ latest_conditions = {
     "pressure_inhg_station": None,  # NOT sea-level-adjusted -- deferred
     "rain_this_interval_in": None,
 }
-latest_strike = {
-    "detected": False,
-    "detected_at": None,
-    "distance_mi": None,
-    # NOTE: raw, unfiltered -- does not yet apply the 10-mile cutoff or
-    # heavy/sporadic classification. That's separate, deliberately
-    # deferred work.
-}
+
+# --- Lightning: 10-mile filter + heavy/sporadic classification ---
+# Confirmed requirement: only strikes within this radius matter to this
+# device at all -- farther strikes are outside scope, not tracked.
+LIGHTNING_FILTER_RADIUS_MI = 10.0
+
+# PLACEHOLDERS -- these need Dan's own bench-testing calibration once
+# real hardware/real storms exist to test against, per the project's
+# own guardrail against guessed defaults. Not confirmed-correct values.
+LIGHTNING_WINDOW_MINUTES = 10
+LIGHTNING_FREQUENT_THRESHOLD = 3  # this many or more strikes in the
+                                   # window = "frequent"; fewer = "sporadic"
+
+# Raw list of {"distance_mi": float, "at": datetime} for strikes within
+# the filter radius, pruned to the rolling window on every read AND on
+# every new strike -- not just when a new strike arrives, since a storm
+# that passed 20 minutes ago must stop showing "frequent" even with no
+# new packets to trigger a re-check.
+recent_strikes = []
+
 latest_nws = {
     # "available" is true ONLY after a successful poll -- per the
     # project's own guardrail, an empty alert list must never be shown
     # unless it came from a real, fresh, successful retrieval. A failed
-    # poll leaves available=False rather than silently keeping stale
-    # data marked as current.
+    # poll leaves available=False without touching tracked_alerts below,
+    # so stale data stays visible (with available correctly flagging it
+    # as untrustworthy) rather than being cleared outright.
     "available": False,
     "last_polled_at": None,
-    "alerts": [],  # only meaningful when available is True
 }
 
 
@@ -137,26 +153,120 @@ def handle_obs_st(msg):
         latest_conditions["rain_this_interval_in"] = round(obs[12] * MM_TO_IN, 3)
 
 
+def _prune_recent_strikes_locked():
+    """Remove strikes older than the classification window. Caller must
+    already hold state_lock."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=LIGHTNING_WINDOW_MINUTES)
+    recent_strikes[:] = [s for s in recent_strikes if s["at"] >= cutoff]
+
+
 def handle_evt_strike(msg):
     epoch, distance_km, energy = msg["evt"]
+    distance_mi = distance_km * KM_TO_MI
+
+    if distance_mi > LIGHTNING_FILTER_RADIUS_MI:
+        # Outside the confirmed 10-mile scope -- not relevant to this
+        # device, deliberately not tracked at all.
+        return
+
+    strike_time = datetime.fromtimestamp(epoch, tz=timezone.utc)
     with state_lock:
-        latest_strike["detected"] = True
-        latest_strike["detected_at"] = iso_time(epoch)
-        latest_strike["distance_mi"] = round(distance_km * KM_TO_MI, 1)
+        recent_strikes.append({"distance_mi": distance_mi, "at": strike_time})
+        _prune_recent_strikes_locked()
 
 
-def poll_nws_once():
-    try:
-        response = requests.get(NWS_URL, headers=NWS_HEADERS, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        features = data.get("features", [])
+def get_lightning_status():
+    """Prune and classify against the current moment -- called on every
+    API request, not just when a new strike arrives, so a storm that
+    has moved on correctly stops showing as active."""
+    with state_lock:
+        _prune_recent_strikes_locked()
+        count = len(recent_strikes)
 
-        alerts = []
-        for feature in features:
-            props = feature.get("properties", {})
-            alerts.append({
-                "id": props.get("id"),
+        if count == 0:
+            return {
+                "active": False,
+                "level": "none",
+                "closest_distance_mi": None,
+                "most_recent_strike_at": None,
+                "strike_count_recent": 0,
+                "window_minutes": LIGHTNING_WINDOW_MINUTES,
+                "filter_radius_mi": LIGHTNING_FILTER_RADIUS_MI,
+            }
+
+        closest = min(s["distance_mi"] for s in recent_strikes)
+        most_recent = max(s["at"] for s in recent_strikes)
+        level = "frequent" if count >= LIGHTNING_FREQUENT_THRESHOLD else "sporadic"
+
+        return {
+            "active": True,
+            "level": level,
+            "closest_distance_mi": round(closest, 1),
+            "most_recent_strike_at": most_recent.isoformat(),
+            "strike_count_recent": count,
+            "window_minutes": LIGHTNING_WINDOW_MINUTES,
+            "filter_radius_mi": LIGHTNING_FILTER_RADIUS_MI,
+        }
+
+
+
+# --- NWS alert lifecycle tracking ---
+# Tracked by stable NWS `id`, not by event-name/text matching, per the
+# project's own confirmed requirement.
+
+# PROPOSAL, not yet confirmed with Dan -- maps raw NWS fields to the
+# device's five-tier vocabulary (Critical/Warning/Watch/Advisory/
+# Informational). Primarily event-name based since that's the most
+# reliable signal for the Warning/Watch/Advisory distinction; CAP's
+# `severity` field splits Critical out from an ordinary Warning.
+LEVEL_RANK = {
+    "informational": 0,
+    "advisory": 1,
+    "watch": 2,
+    "warning": 3,
+    "critical": 4,
+}
+
+
+def classify_level(props):
+    event = (props.get("event") or "").lower()
+    severity = props.get("severity") or "Unknown"
+
+    if "warning" in event:
+        return "critical" if severity == "Extreme" else "warning"
+    if "watch" in event:
+        return "watch"
+    if "advisory" in event:
+        return "advisory"
+    return "informational"
+
+
+# id -> alert record. In-memory only -- persistence across a restart is
+# separate, deliberately deferred work (see project brief).
+tracked_alerts = {}
+
+ALERT_EXPIRY_CLEANUP_MINUTES = 30  # how long an expired alert stays
+                                     # visible internally before being
+                                     # dropped, bounding memory growth
+                                     # without needing real persistence
+
+
+def process_nws_alerts_locked(raw_props_list):
+    """Update tracked_alerts against a fresh poll's raw properties list.
+    Caller must already hold state_lock."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    current_ids = set()
+
+    for props in raw_props_list:
+        alert_id = props.get("id")
+        if not alert_id:
+            continue
+        current_ids.add(alert_id)
+        level = classify_level(props)
+
+        if alert_id not in tracked_alerts:
+            tracked_alerts[alert_id] = {
+                "id": alert_id,
                 "event": props.get("event"),
                 "severity": props.get("severity"),
                 "urgency": props.get("urgency"),
@@ -165,14 +275,83 @@ def poll_nws_once():
                 "expires": props.get("expires"),
                 "headline": props.get("headline"),
                 "instruction": props.get("instruction"),
-            })
+                "level": level,
+                "acknowledged": False,
+                "last_transition": "new",
+                "first_seen_at": now_iso,
+                "last_updated_at": now_iso,
+            }
+            continue
+
+        existing = tracked_alerts[alert_id]
+        old_level = existing["level"]
+        content_changed = (
+            existing["event"] != props.get("event")
+            or existing["headline"] != props.get("headline")
+            or existing["instruction"] != props.get("instruction")
+            or existing["expires"] != props.get("expires")
+            or old_level != level
+        )
+
+        if not content_changed:
+            existing["last_transition"] = "unchanged"
+        elif LEVEL_RANK.get(level, 0) > LEVEL_RANK.get(old_level, 0):
+            # Escalation -- confirmed policy: clears acknowledgement,
+            # forcing the alert to sound again at the new level.
+            existing["acknowledged"] = False
+            existing["last_transition"] = "escalated"
+        else:
+            # Content changed but didn't escalate -- ack is preserved.
+            existing["last_transition"] = "updated"
+
+        existing["event"] = props.get("event")
+        existing["severity"] = props.get("severity")
+        existing["urgency"] = props.get("urgency")
+        existing["certainty"] = props.get("certainty")
+        existing["onset"] = props.get("onset")
+        existing["expires"] = props.get("expires")
+        existing["headline"] = props.get("headline")
+        existing["instruction"] = props.get("instruction")
+        existing["level"] = level
+        existing["last_updated_at"] = now_iso
+
+    # Anything tracked but no longer in NWS's active list has expired.
+    # NWS's active-alerts feed doesn't distinguish a true cancellation
+    # from natural expiration -- both simply disappear from it, so both
+    # are treated the same way here.
+    for alert_id, existing in tracked_alerts.items():
+        if alert_id not in current_ids and existing["last_transition"] != "expired":
+            existing["last_transition"] = "expired"
+            existing["last_updated_at"] = now_iso
+
+    # Bound memory growth: drop alerts that have been expired for a
+    # while, rather than keeping every alert ever seen forever. This is
+    # not real persistence -- just keeps a long-running process's memory
+    # from growing unbounded across weeks of uptime.
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=ALERT_EXPIRY_CLEANUP_MINUTES)
+    to_remove = [
+        aid for aid, a in tracked_alerts.items()
+        if a["last_transition"] == "expired"
+        and datetime.fromisoformat(a["last_updated_at"]) < cutoff
+    ]
+    for aid in to_remove:
+        del tracked_alerts[aid]
+
+
+def poll_nws_once():
+    try:
+        response = requests.get(NWS_URL, headers=NWS_HEADERS, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        features = data.get("features", [])
+        raw_props_list = [f.get("properties", {}) for f in features]
 
         with state_lock:
             latest_nws["available"] = True
             latest_nws["last_polled_at"] = datetime.now(timezone.utc).isoformat()
-            latest_nws["alerts"] = alerts
+            process_nws_alerts_locked(raw_props_list)
 
-        print(f"[nws] Poll succeeded -- {len(alerts)} active alert(s)")
+        print(f"[nws] Poll succeeded -- {len(raw_props_list)} active alert(s) from NWS")
 
     except requests.RequestException as e:
         with state_lock:
@@ -222,7 +401,7 @@ def udp_listener_thread():
             print(f"[udp] obs_st received, temp={latest_conditions['temperature_f']}F")
         elif msg_type == "evt_strike":
             handle_evt_strike(msg)
-            print(f"[udp] evt_strike received, distance={latest_strike['distance_mi']}mi")
+            print(f"[udp] evt_strike received (logged after distance filter/pruning)")
 
 
 app = Flask(__name__)
@@ -231,15 +410,51 @@ app = Flask(__name__)
 @app.route("/api/conditions")
 def api_conditions():
     with state_lock:
-        return jsonify({
-            "tempest": dict(latest_conditions),
-            "last_strike": dict(latest_strike),
-            "nws": {
-                "available": latest_nws["available"],
-                "last_polled_at": latest_nws["last_polled_at"],
-                "alerts": list(latest_nws["alerts"]),
-            },
-        })
+        tempest_copy = dict(latest_conditions)
+        nws_available = latest_nws["available"]
+        nws_last_polled = latest_nws["last_polled_at"]
+        alerts_copy = [
+            {
+                **alert,
+                "needs_alert": (
+                    alert["last_transition"] in ("new", "escalated")
+                    and not alert["acknowledged"]
+                ),
+            }
+            for alert in tracked_alerts.values()
+            if alert["last_transition"] != "expired"
+        ]
+
+    # Called OUTSIDE the block above, deliberately -- get_lightning_status()
+    # acquires state_lock itself, and this lock is a plain threading.Lock
+    # (not reentrant), so calling it while still holding the lock above
+    # would deadlock the very first time this endpoint is hit.
+    lightning_status = get_lightning_status()
+
+    return jsonify({
+        "tempest": tempest_copy,
+        "lightning": lightning_status,
+        "nws": {
+            "available": nws_available,
+            "last_polled_at": nws_last_polled,
+            "alerts": alerts_copy,
+        },
+    })
+
+
+@app.route("/api/alerts/ack", methods=["POST"])
+def api_ack_alert():
+    data = request.get_json(silent=True) or {}
+    alert_id = data.get("id")
+    if not alert_id:
+        return jsonify({"error": "missing 'id' in request body"}), 400
+
+    with state_lock:
+        if alert_id not in tracked_alerts:
+            return jsonify({"error": "unknown alert id"}), 404
+        tracked_alerts[alert_id]["acknowledged"] = True
+
+    return jsonify({"status": "ok", "id": alert_id})
 
 
 @app.route("/healthz")
