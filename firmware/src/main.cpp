@@ -41,24 +41,33 @@ static int simulatedCondition = 1;  // 0=clear, 1=lightning, 2=warning
                                      // which aren't wired to real data yet.
                                      // Only the Now page uses real state below.
 
-// ---- Real fetched conditions (Now page only, this pass) ----
+// ---- Real fetched conditions (all five screens use this now) ----
 bool tempestAvailable = false;
 float tempestTempF = 0;
 float tempestHumidityPct = 0;
 float tempestWindMph = 0;
 float tempestGustMph = 0;
 float tempestRainIn = 0;
+float tempestPressureInHg = 0;
 String tempestWindDir = "";
 
 bool lightningActive = false;
 String lightningLevel = "none";
+float lightningClosestDistanceMi = 0;
+String lightningMostRecentAt = "";
+int lightningStrikeCountRecent = 0;
 
 bool nwsAvailable = false;
 int nwsAlertCount = 0;
 String nwsFirstAlertEvent = "";
 String nwsFirstAlertExpires = "";
+String nwsFirstAlertInstruction = "";
 
 bool hasEverFetchedSuccessfully = false;
+bool lastFetchSucceeded = false;  // distinct from the above -- this can
+                                    // flip back to false if the backend
+                                    // goes down AFTER working once; used
+                                    // for the Status page's Backend row
 unsigned long lastSuccessfulFetchMillis = 0;
 
 const unsigned long FETCH_INTERVAL_MS = 60000;  // 60s -- matches obs_st's
@@ -89,6 +98,20 @@ String extractTimeFromIso(const String &iso) {
     return "unknown time";
   }
   return iso.substring(tIndex + 1, tIndex + 6);
+}
+
+String formatUptimeString() {
+  // Purely local -- time since boot, needs neither the server nor NTP.
+  unsigned long totalSec = millis() / 1000;
+  unsigned long days = totalSec / 86400;
+  unsigned long hours = (totalSec % 86400) / 3600;
+  unsigned long mins = (totalSec % 3600) / 60;
+  if (days > 0) {
+    return String(days) + "d " + String(hours) + "h " + String(mins) + "m";
+  } else if (hours > 0) {
+    return String(hours) + "h " + String(mins) + "m";
+  }
+  return String(mins) + "m";
 }
 
 static const unsigned long LONG_PRESS_MS = 1000;
@@ -311,73 +334,119 @@ void drawWindRainPage() {
 
   M5.Display.setTextDatum(top_left);
 
+  if (!tempestAvailable) {
+    M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+    M5.Display.setTextSize(2);
+    M5.Display.drawString(hasEverFetchedSuccessfully ? "Tempest data unavailable"
+                                                       : "Waiting for first data...",
+                           16, 60);
+    return;
+  }
+
+  char windLabel[16], windStr[20], gustStr[20];
+  snprintf(windLabel, sizeof(windLabel), "WIND (%s)", tempestWindDir.c_str());
+  snprintf(windStr, sizeof(windStr), "%.0f mph", tempestWindMph);
+  snprintf(gustStr, sizeof(gustStr), "%.0f mph", tempestGustMph);
+
   // Row 1: Wind + Gust
   M5.Display.setTextColor(COLOR_LABEL, COLOR_BG);
   M5.Display.setTextSize(1);
-  M5.Display.drawString("WIND (NW)", 16, 48);
+  M5.Display.drawString(windLabel, 16, 48);
   M5.Display.drawString("GUST", 170, 48);
 
   M5.Display.setTextColor(COLOR_TEXT_PRIMARY, COLOR_BG);
   M5.Display.setTextSize(3);
-  M5.Display.drawString("6 mph", 16, 64);
-  M5.Display.drawString("14 mph", 170, 64);
+  M5.Display.drawString(windStr, 16, 64);
+  M5.Display.drawString(gustStr, 170, 64);
 
   M5.Display.drawFastHLine(16, 100, 288, COLOR_SEPARATOR);
 
-  // Row 2: Rain today + Rain rate
+  // Row 2: rain. The server only reports rain for its own ~1-minute
+  // report interval, not a running daily total (a known, documented
+  // gap) -- labeled honestly as such rather than mislabeled "today".
+  // Rain rate isn't computed server-side at all yet -- shown as "--"
+  // rather than fabricated or duplicating the interval value.
+  char rainStr[16];
+  snprintf(rainStr, sizeof(rainStr), "%.2f\"", tempestRainIn);
+
   M5.Display.setTextColor(COLOR_LABEL, COLOR_BG);
   M5.Display.setTextSize(1);
-  M5.Display.drawString("RAIN TODAY", 16, 110);
+  M5.Display.drawString("RAIN (LAST MIN)", 16, 110);
   M5.Display.drawString("RAIN RATE", 170, 110);
 
   M5.Display.setTextColor(COLOR_TEXT_PRIMARY, COLOR_BG);
   M5.Display.setTextSize(3);
-  M5.Display.drawString("0.02\"", 16, 126);
-  M5.Display.drawString("0.00\"/hr", 170, 126);
+  M5.Display.drawString(rainStr, 16, 126);
+  M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+  M5.Display.drawString("--", 170, 126);
 
   M5.Display.drawFastHLine(16, 162, 288, COLOR_SEPARATOR);
 
-  // Row 3: Pressure + trend
+  // Row 3: pressure. Station-only, not sea-level-adjusted (a known,
+  // documented server-side gap) -- labeled honestly. Trend isn't
+  // computed server-side yet, shown as "--" rather than fabricated.
+  char pressureStr[16];
+  snprintf(pressureStr, sizeof(pressureStr), "%.2f inHg", tempestPressureInHg);
+
   M5.Display.setTextColor(COLOR_LABEL, COLOR_BG);
   M5.Display.setTextSize(1);
-  M5.Display.drawString("PRESSURE", 16, 172);
+  M5.Display.drawString("PRESSURE (STATION)", 16, 172);
 
   M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
   M5.Display.setTextSize(2);
-  M5.Display.drawString("29.91 inHg", 16, 188);
-  M5.Display.setTextColor(COLOR_NWS_CLEAR_TEXT, COLOR_BG);
-  M5.Display.drawString("Falling", 190, 188);
+  M5.Display.drawString(pressureStr, 16, 188);
+  M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+  M5.Display.drawString("--", 190, 188);
 }
 
 void drawLightningPage() {
   drawSecondaryHeader("Lightning", PAGE_LIGHTNING);
 
-  // Status badge -- same amber palette as the Now-screen banner.
-  // Fixed height (50px) regardless of which classification text is
-  // active, so the rest of the page doesn't shift between states.
-  // "Frequent lightning nearby" doesn't fit on one line at size 2
-  // (confirmed on real hardware -- it ran past the box edge), so long
-  // text splits onto two lines; short text ("Lightning nearby") just
-  // uses the first line and leaves the second blank.
-  M5.Display.fillRoundRect(16, 48, 288, 50, 6, COLOR_LIGHTNING_BG);
-  M5.Display.drawRoundRect(16, 48, 288, 50, 6, COLOR_LIGHTNING_BORDER);
-  M5.Display.setTextDatum(top_left);
-  M5.Display.setTextColor(COLOR_LIGHTNING_TEXT, COLOR_LIGHTNING_BG);
-  M5.Display.setTextSize(2);
-  M5.Display.drawString("Frequent lightning", 26, 56);
-  M5.Display.drawString("nearby", 26, 76);
+  // Badge: amber "active" treatment when lightning.active is true (same
+  // fixed-height, two-line-capable box already confirmed working on
+  // hardware); a new, NOT previously mocked/approved neutral "clear"
+  // treatment otherwise, since the approved mockup only ever showed the
+  // active state -- worth a look once this is on real hardware.
+  if (lightningActive) {
+    M5.Display.fillRoundRect(16, 48, 288, 50, 6, COLOR_LIGHTNING_BG);
+    M5.Display.drawRoundRect(16, 48, 288, 50, 6, COLOR_LIGHTNING_BORDER);
+    M5.Display.setTextDatum(top_left);
+    M5.Display.setTextColor(COLOR_LIGHTNING_TEXT, COLOR_LIGHTNING_BG);
+    M5.Display.setTextSize(2);
+    if (lightningLevel == "frequent") {
+      M5.Display.drawString("Frequent lightning", 26, 56);
+      M5.Display.drawString("nearby", 26, 76);
+    } else {
+      M5.Display.drawString("Lightning nearby", 26, 66);
+    }
+  } else {
+    M5.Display.fillRoundRect(16, 48, 288, 50, 6, COLOR_BG);
+    M5.Display.drawRoundRect(16, 48, 288, 50, 6, COLOR_SEPARATOR);
+    M5.Display.setTextDatum(top_left);
+    M5.Display.setTextColor(COLOR_NWS_CLEAR_TEXT, COLOR_BG);
+    M5.Display.setTextSize(2);
+    M5.Display.drawString("No lightning nearby", 26, 66);
+  }
 
   // Closest recent strike
   M5.Display.setTextColor(COLOR_LABEL, COLOR_BG);
   M5.Display.setTextSize(1);
   M5.Display.drawString("CLOSEST RECENT STRIKE", 16, 108);
 
-  M5.Display.setTextColor(COLOR_TEXT_PRIMARY, COLOR_BG);
+  M5.Display.setTextColor(lightningActive ? COLOR_TEXT_PRIMARY : COLOR_TEXT_DIM, COLOR_BG);
   M5.Display.setTextSize(3);
-  M5.Display.drawString("2.3 mi", 16, 124);
-  M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
-  M5.Display.setTextSize(2);
-  M5.Display.drawString("40 sec ago", 130, 130);
+  if (lightningActive) {
+    char distStr[12];
+    snprintf(distStr, sizeof(distStr), "%.1f mi", lightningClosestDistanceMi);
+    M5.Display.drawString(distStr, 16, 124);
+    M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
+    M5.Display.setTextSize(2);
+    // Crude time extraction, same placeholder approach as the NWS
+    // "until" time -- real relative-age formatting needs NTP.
+    M5.Display.drawString(extractTimeFromIso(lightningMostRecentAt), 130, 130);
+  } else {
+    M5.Display.drawString("None", 16, 124);
+  }
 
   M5.Display.drawFastHLine(16, 162, 288, COLOR_SEPARATOR);
 
@@ -386,9 +455,11 @@ void drawLightningPage() {
   M5.Display.setTextSize(1);
   M5.Display.drawString("ACTIVITY (LAST 10 MIN, WITHIN 10 MI)", 16, 172);
 
-  M5.Display.setTextColor(COLOR_TEXT_PRIMARY, COLOR_BG);
+  char countStr[16];
+  snprintf(countStr, sizeof(countStr), "%d strikes", lightningStrikeCountRecent);
+  M5.Display.setTextColor(lightningActive ? COLOR_TEXT_PRIMARY : COLOR_TEXT_DIM, COLOR_BG);
   M5.Display.setTextSize(2);
-  M5.Display.drawString("6 strikes", 16, 188);
+  M5.Display.drawString(lightningActive ? countStr : "0 strikes", 16, 188);
 }
 
 // NWS instruction text: word-wrap + truncation.
@@ -449,34 +520,53 @@ int wrapInstructionText(const String &text, String outLines[], int maxLines) {
 void drawNwsAlertsPage() {
   drawSecondaryHeader("NWS Alerts", PAGE_NWS_ALERTS);
 
+  M5.Display.setTextDatum(top_left);
+
+  if (!nwsAvailable) {
+    // Same "status unknown" language as the Now screen's footer -- never
+    // let an unreachable NWS check look like a real, checked "clear".
+    M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+    M5.Display.setTextSize(2);
+    M5.Display.drawString("NWS status unknown", 16, 60);
+    return;
+  }
+
+  if (nwsAlertCount == 0) {
+    // No approved mockup for this state (the v2 layout only ever showed
+    // an active alert) -- simple, calm treatment, consistent with the
+    // Now screen's own "NO ACTIVE ALERTS" language and color.
+    M5.Display.fillCircle(28, 66, 5, COLOR_NWS_CLEAR_DOT);
+    M5.Display.setTextColor(COLOR_NWS_CLEAR_TEXT, COLOR_BG);
+    M5.Display.setTextSize(2);
+    M5.Display.drawString("No active alerts", 42, 58);
+    return;
+  }
+
   // Consolidated event + until block (v2 layout -- headline field
   // deliberately dropped in favor of more room for instruction text;
-  // see project brief for the reasoning Dan approved).
+  // see project brief for the reasoning Dan approved). Now using the
+  // real first active alert's event name and expiration.
   M5.Display.fillRect(16, 48, 288, 34, COLOR_WARNING_BG);
-  M5.Display.setTextDatum(top_left);
   M5.Display.setTextColor(COLOR_WARNING_TEXT_HEADLINE, COLOR_WARNING_BG);
   M5.Display.setTextSize(2);
-  M5.Display.drawString("SEVERE T-STORM WARNING", 24, 54);
+  M5.Display.drawString(nwsFirstAlertEvent, 24, 54);
   M5.Display.setTextSize(1);
   M5.Display.setTextColor(COLOR_WARNING_TEXT_DETAIL, COLOR_WARNING_BG);
-  M5.Display.drawString("Until 11:45 PM", 24, 72);
+  // Crude time extraction, same placeholder as elsewhere -- real
+  // relative/12-hour formatting needs NTP (a separate step).
+  String untilText = "Until " + extractTimeFromIso(nwsFirstAlertExpires);
+  M5.Display.drawString(untilText, 24, 72);
 
   // Instruction: full official text, word-wrapped and truncated with an
-  // indicator if it runs longer than the available space -- this now
-  // handles real (longer or shorter) NWS instruction text correctly,
-  // not just this one hardcoded demo string.
+  // indicator if it runs longer than the available space. Now using the
+  // real instruction text from the active alert.
   M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
   M5.Display.setTextSize(1);
   M5.Display.drawString("INSTRUCTION", 16, 92);
 
-  String instructionText =
-      "Torrential rainfall is occurring with this storm and may lead to "
-      "flash flooding. Persons in low-lying areas should move to higher "
-      "ground now. Do not walk or drive into flooded areas. Turn around, "
-      "don't drown.";
-
   String wrappedLines[NWS_MAX_INSTRUCTION_LINES];
-  int lineCount = wrapInstructionText(instructionText, wrappedLines, NWS_MAX_INSTRUCTION_LINES);
+  int lineCount = wrapInstructionText(nwsFirstAlertInstruction, wrappedLines,
+                                       NWS_MAX_INSTRUCTION_LINES);
 
   M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
   M5.Display.setTextSize(2);
@@ -506,12 +596,20 @@ void drawStatusPage() {
     wifiDotColor = COLOR_STATUS_BAD;
   }
 
+  // Backend row: reflects whether the MOST RECENT fetch attempt
+  // succeeded, not just whether one ever has -- so this correctly flips
+  // to "Unreachable" if the server goes down after working fine earlier,
+  // rather than staying stuck on a stale "Reachable" forever.
+  String backendValue = lastFetchSucceeded ? "Reachable" : "Unreachable";
+  uint16_t backendDotColor = lastFetchSucceeded ? COLOR_NWS_CLEAR_DOT : COLOR_STATUS_BAD;
+
+  // Time sync: still dummy -- genuinely needs the NTP step, not built yet.
   struct StatusRow { const char *label; String value; uint16_t dotColor; };
   StatusRow rows[4] = {
     {"Wi-Fi",      wifiValue,             wifiDotColor},
-    {"Backend",    "Reachable",           COLOR_NWS_CLEAR_DOT},
-    {"Last sync",  "1 min ago",           COLOR_NWS_CLEAR_DOT},
-    {"Time sync",  "OK (NTP)",            COLOR_NWS_CLEAR_DOT},
+    {"Backend",    backendValue,          backendDotColor},
+    {"Last sync",  formatAgeString(),     COLOR_NWS_CLEAR_DOT},
+    {"Time sync",  "Not yet built",       COLOR_TEXT_DIM},
   };
 
   int y = 52;
@@ -536,7 +634,7 @@ void drawStatusPage() {
 
   M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
   M5.Display.setTextSize(2);
-  M5.Display.drawString("3d 4h 12m", 16, y + 16);
+  M5.Display.drawString(formatUptimeString(), 16, y + 16);
   M5.Display.drawString("v0.1.0-dev", 170, y + 16);
 }
 
@@ -632,6 +730,7 @@ const char *SERVER_URL = "http://192.168.6.29:8085/api/conditions";
 void fetchConditions() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[fetch] Skipped -- Wi-Fi not connected");
+    lastFetchSucceeded = false;
     return;
   }
 
@@ -643,6 +742,7 @@ void fetchConditions() {
   if (httpCode != 200) {
     Serial.printf("[fetch] HTTP request FAILED, code: %d\n", httpCode);
     http.end();
+    lastFetchSucceeded = false;
     return;
   }
 
@@ -655,6 +755,7 @@ void fetchConditions() {
 
   if (error) {
     Serial.printf("[fetch] JSON parse FAILED: %s\n", error.c_str());
+    lastFetchSucceeded = false;
     return;
   }
 
@@ -665,11 +766,17 @@ void fetchConditions() {
     tempestWindMph = doc["tempest"]["wind_mph"];
     tempestGustMph = doc["tempest"]["gust_mph"];
     tempestRainIn = doc["tempest"]["rain_this_interval_in"];
+    tempestPressureInHg = doc["tempest"]["pressure_inhg_station"];
     tempestWindDir = doc["tempest"]["wind_direction"].as<String>();
   }
 
   lightningActive = doc["lightning"]["active"];
   lightningLevel = doc["lightning"]["level"].as<String>();
+  if (lightningActive) {
+    lightningClosestDistanceMi = doc["lightning"]["closest_distance_mi"];
+    lightningMostRecentAt = doc["lightning"]["most_recent_strike_at"].as<String>();
+    lightningStrikeCountRecent = doc["lightning"]["strike_count_recent"];
+  }
 
   nwsAvailable = doc["nws"]["available"];
   JsonArray alerts = doc["nws"]["alerts"];
@@ -677,12 +784,15 @@ void fetchConditions() {
   if (nwsAlertCount > 0) {
     nwsFirstAlertEvent = alerts[0]["event"].as<String>();
     nwsFirstAlertExpires = alerts[0]["expires"].as<String>();
+    nwsFirstAlertInstruction = alerts[0]["instruction"].as<String>();
   } else {
     nwsFirstAlertEvent = "";
     nwsFirstAlertExpires = "";
+    nwsFirstAlertInstruction = "";
   }
 
   hasEverFetchedSuccessfully = true;
+  lastFetchSucceeded = true;
   lastSuccessfulFetchMillis = millis();
 
   Serial.printf("[fetch] State updated -- tempest.available=%s temp=%.1f wind=%.1f dir=%s\n",
