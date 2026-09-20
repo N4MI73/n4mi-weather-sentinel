@@ -47,7 +47,7 @@ static uint16_t COLOR_BG, COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY, COLOR_TEXT_D
     COLOR_SEPARATOR, COLOR_NWS_CLEAR_DOT, COLOR_NWS_CLEAR_TEXT,
     COLOR_LIGHTNING_BG, COLOR_LIGHTNING_BORDER, COLOR_LIGHTNING_TEXT,
     COLOR_WARNING_BG, COLOR_WARNING_TEXT_HEADLINE, COLOR_WARNING_TEXT_DETAIL,
-    COLOR_LABEL;
+    COLOR_LABEL, COLOR_STATUS_BAD;
 
 void initColors() {
   COLOR_BG               = M5.Display.color565(0x04, 0x04, 0x04);
@@ -64,6 +64,7 @@ void initColors() {
   COLOR_WARNING_TEXT_HEADLINE = M5.Display.color565(0xff, 0xb3, 0xb3);
   COLOR_WARNING_TEXT_DETAIL   = M5.Display.color565(0xe0, 0x8a, 0x8a);
   COLOR_LABEL             = M5.Display.color565(0x6a, 0x6a, 0x6a);
+  COLOR_STATUS_BAD        = M5.Display.color565(0xcc, 0x33, 0x33);
 }
 
 // ---- Now screen (unchanged from the approved design) ----
@@ -397,9 +398,23 @@ void drawStatusPage() {
 
   M5.Display.setTextDatum(top_left);
 
-  struct StatusRow { const char *label; const char *value; uint16_t dotColor; };
+  // Wi-Fi row now reflects the real connection state from connectWiFi()
+  // (Phase 2a) instead of a hardcoded dummy value -- the other three
+  // rows are still dummy data, pending the HTTP fetch and NTP work.
+  bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+  String wifiValue;
+  uint16_t wifiDotColor;
+  if (wifiConnected) {
+    wifiValue = "Connected (" + String(WiFi.RSSI()) + " dBm)";
+    wifiDotColor = COLOR_NWS_CLEAR_DOT;
+  } else {
+    wifiValue = "Disconnected";
+    wifiDotColor = COLOR_STATUS_BAD;
+  }
+
+  struct StatusRow { const char *label; String value; uint16_t dotColor; };
   StatusRow rows[4] = {
-    {"Wi-Fi",      "Connected (-58 dBm)", COLOR_NWS_CLEAR_DOT},
+    {"Wi-Fi",      wifiValue,             wifiDotColor},
     {"Backend",    "Reachable",           COLOR_NWS_CLEAR_DOT},
     {"Last sync",  "1 min ago",           COLOR_NWS_CLEAR_DOT},
     {"Time sync",  "OK (NTP)",            COLOR_NWS_CLEAR_DOT},
