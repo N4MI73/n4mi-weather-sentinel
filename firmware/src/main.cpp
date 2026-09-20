@@ -15,6 +15,8 @@
 // Dan approved rather than placeholders.
 
 #include <M5Unified.h>
+#include <WiFi.h>
+#include "wifi_credentials.h"
 
 enum Page {
   PAGE_NOW = 0,
@@ -467,6 +469,40 @@ void renderPage(Page p) {
   drawPersistentStrip();
 }
 
+// Phase 2a: Wi-Fi connectivity only -- no HTTP fetch, no screen changes
+// yet. Uses the wifi_credentials.h stopgap (real captive portal comes
+// later, per project instructions). Success/failure reported to serial
+// only for this step; the display keeps showing its existing
+// static/dummy content exactly as before.
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000;
+
+void connectWiFi() {
+  Serial.println();
+  Serial.printf("Connecting to Wi-Fi: %s", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long startAttempt = millis();
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - startAttempt < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Wi-Fi connected!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    Serial.printf("Signal strength (RSSI): %d dBm\n", WiFi.RSSI());
+  } else {
+    Serial.println("Wi-Fi connection FAILED (timed out after 20s).");
+    Serial.println("Check wifi_credentials.h has the correct SSID/password,");
+    Serial.println("and that the network is 2.4GHz -- the CoreS3 SE's");
+    Serial.println("Wi-Fi radio does not support 5GHz networks at all.");
+  }
+}
+
 void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
@@ -476,6 +512,8 @@ void setup() {
   Serial.println();
   Serial.println("=== Weather Sentinel -- Navigation demo ===");
   Serial.println("Tap to advance page. Long-press (~1s) for Settings.");
+
+  connectWiFi();
 
   initColors();
   lastActivityTime = millis();
