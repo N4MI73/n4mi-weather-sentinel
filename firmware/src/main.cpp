@@ -16,6 +16,8 @@
 
 #include <M5Unified.h>
 #include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 #include "wifi_credentials.h"
 
 enum Page {
@@ -518,6 +520,68 @@ void connectWiFi() {
   }
 }
 
+// Phase 2b: one HTTP fetch + JSON parse, printed to serial only -- no
+// screen changes yet, and not on a repeating timer yet either. Purpose
+// is narrowly to prove the device can reach the real server and parse
+// its actual response shape, before wiring any of it into the UI.
+//
+// Uses ArduinoJson v7 (pinned in platformio.ini) -- its JsonDocument
+// class doesn't need a compile-time capacity like v6's StaticJsonDocument
+// did. Not compiled/tested by me (same sandbox limitation as always for
+// firmware); ArduinoJson's basic deserialize+access pattern is about as
+// standard as this ecosystem gets, but "standard" isn't "verified on
+// real hardware" -- treat this the same as everything else that needs
+// a real build to confirm.
+const char *SERVER_URL = "http://192.168.6.29:8085/api/conditions";
+
+void fetchConditionsOnce() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[fetch] Skipped -- Wi-Fi not connected");
+    return;
+  }
+
+  Serial.println("[fetch] Requesting /api/conditions...");
+  HTTPClient http;
+  http.begin(SERVER_URL);
+  int httpCode = http.GET();
+
+  if (httpCode != 200) {
+    Serial.printf("[fetch] HTTP request FAILED, code: %d\n", httpCode);
+    http.end();
+    return;
+  }
+
+  String payload = http.getString();
+  http.end();
+  Serial.printf("[fetch] Got response, %d bytes\n", payload.length());
+
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, payload);
+
+  if (error) {
+    Serial.printf("[fetch] JSON parse FAILED: %s\n", error.c_str());
+    return;
+  }
+
+  bool tempestAvailable = doc["tempest"]["available"];
+  Serial.printf("[fetch] tempest.available = %s\n", tempestAvailable ? "true" : "false");
+  if (tempestAvailable) {
+    float tempF = doc["tempest"]["temperature_f"];
+    float windMph = doc["tempest"]["wind_mph"];
+    const char *windDir = doc["tempest"]["wind_direction"];
+    Serial.printf("[fetch]   temperature_f=%.1f  wind_mph=%.1f  dir=%s\n",
+                  tempF, windMph, windDir);
+  }
+
+  const char *lightningLevel = doc["lightning"]["level"];
+  Serial.printf("[fetch] lightning.level = %s\n", lightningLevel);
+
+  bool nwsAvailable = doc["nws"]["available"];
+  int alertCount = doc["nws"]["alerts"].size();
+  Serial.printf("[fetch] nws.available = %s, alert count = %d\n",
+                nwsAvailable ? "true" : "false", alertCount);
+}
+
 void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
@@ -529,6 +593,7 @@ void setup() {
   Serial.println("Tap to advance page. Long-press (~1s) for Settings.");
 
   connectWiFi();
+  fetchConditionsOnce();
 
   initColors();
   lastActivityTime = millis();
