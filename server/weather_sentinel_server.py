@@ -198,6 +198,14 @@ def nws_poller_thread():
 def udp_listener_thread():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # SO_REUSEPORT (not just SO_REUSEADDR) is what actually allows two
+    # separate processes -- this one and WeeWX's own container, also
+    # using network_mode: host to receive this exact same broadcast --
+    # to both bind port 50222 and each get their own copy of every
+    # packet. Discovered necessary in practice: SO_REUSEADDR alone
+    # produced "Address already in use" against the real NAS deployment.
+    if hasattr(socket, "SO_REUSEPORT"):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
     sock.bind(("", UDP_PORT))
     print(f"[udp] Listening on port {UDP_PORT}")
 
