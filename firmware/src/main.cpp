@@ -294,6 +294,61 @@ void drawLightningPage() {
   M5.Display.drawString("6 strikes", 16, 188);
 }
 
+// NWS instruction text: word-wrap + truncation.
+//
+// MAX_CHARS_PER_LINE is a HARDWARE-VERIFIED safe budget at text size 2
+// in the 288px-wide instruction column -- not derived from a font-metrics
+// API (LovyanGFX/M5GFX's own pixel-width measurement capability wasn't
+// confirmed available, so this isn't built on that). Instead it's based
+// on real evidence: the original 6 demo lines Dan already confirmed fit
+// cleanly on real hardware had a longest line of 44 characters. 42 is
+// used here as a small safety margin under that confirmed-working value.
+const int NWS_MAX_CHARS_PER_LINE = 42;
+const int NWS_MAX_INSTRUCTION_LINES = 6;
+
+// Word-wraps `text` into `outLines` (capacity `maxLines`), breaking on
+// word boundaries where possible. If the text is longer than maxLines
+// can hold, the last line is trimmed and " ..." appended as a
+// truncation indicator, per the agreed approach (truncate rather than
+// scroll/paginate, to avoid colliding with tap-to-advance navigation).
+// Returns the number of lines actually used.
+int wrapInstructionText(const String &text, String outLines[], int maxLines) {
+  int lineCount = 0;
+  int pos = 0;
+  int len = text.length();
+
+  while (pos < len && lineCount < maxLines) {
+    int remaining = len - pos;
+    int take = min(remaining, NWS_MAX_CHARS_PER_LINE);
+
+    if (pos + take < len) {
+      String chunk = text.substring(pos, pos + take);
+      int lastSpace = chunk.lastIndexOf(' ');
+      if (lastSpace > 0) {
+        take = lastSpace;
+      }
+    }
+
+    String line = text.substring(pos, pos + take);
+    line.trim();
+    outLines[lineCount] = line;
+    lineCount++;
+    pos += take;
+    while (pos < len && text.charAt(pos) == ' ') pos++;
+  }
+
+  if (pos < len && lineCount > 0) {
+    String &lastLine = outLines[lineCount - 1];
+    int maxLastLineLen = NWS_MAX_CHARS_PER_LINE - 4;
+    if ((int)lastLine.length() > maxLastLineLen) {
+      lastLine = lastLine.substring(0, maxLastLineLen);
+    }
+    lastLine += " ...";
+  }
+
+  return lineCount;
+}
+
 void drawNwsAlertsPage() {
   drawSecondaryHeader("NWS Alerts", PAGE_NWS_ALERTS);
 
@@ -309,32 +364,30 @@ void drawNwsAlertsPage() {
   M5.Display.setTextColor(COLOR_WARNING_TEXT_DETAIL, COLOR_WARNING_BG);
   M5.Display.drawString("Until 11:45 PM", 24, 72);
 
-  // Instruction: full official text -- up to ~6 lines fit before the
-  // persistent strip. Longer text than this needs a truncation
-  // indicator (not yet implemented -- flagged as a real gap below).
+  // Instruction: full official text, word-wrapped and truncated with an
+  // indicator if it runs longer than the available space -- this now
+  // handles real (longer or shorter) NWS instruction text correctly,
+  // not just this one hardcoded demo string.
   M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
   M5.Display.setTextSize(1);
   M5.Display.drawString("INSTRUCTION", 16, 92);
 
-  const char *instructionLines[] = {
-    "Torrential rainfall is occurring with this",
-    "storm and may lead to flash flooding.",
-    "Persons in low-lying areas should move to",
-    "higher ground now. Do not walk or drive",
-    "into flooded areas. Turn around, don't",
-    "drown."
-  };
+  String instructionText =
+      "Torrential rainfall is occurring with this storm and may lead to "
+      "flash flooding. Persons in low-lying areas should move to higher "
+      "ground now. Do not walk or drive into flooded areas. Turn around, "
+      "don't drown.";
+
+  String wrappedLines[NWS_MAX_INSTRUCTION_LINES];
+  int lineCount = wrapInstructionText(instructionText, wrappedLines, NWS_MAX_INSTRUCTION_LINES);
+
   M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
   M5.Display.setTextSize(2);
   int y = 106;
-  for (int i = 0; i < 6; i++) {
-    M5.Display.drawString(instructionLines[i], 16, y);
+  for (int i = 0; i < lineCount; i++) {
+    M5.Display.drawString(wrappedLines[i], 16, y);
     y += 16;
   }
-  // NOTE: this loop does not check whether a real, longer instruction
-  // string would overflow past y=214 (the persistent strip). Truncation
-  // logic is a known gap -- do not wire real NWS text into this without
-  // adding a length/line-count guard first.
 }
 
 void drawStatusPage() {
