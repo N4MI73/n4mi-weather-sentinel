@@ -18,7 +18,13 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <time.h>
 #include "wifi_credentials.h"
+
+// Forward declaration: formatCurrentTime() is defined later (grouped with
+// the rest of the NTP code, near connectWiFi()), but drawNowPage() above
+// that point needs to call it.
+String formatCurrentTime();
 
 enum Page {
   PAGE_NOW = 0,
@@ -32,14 +38,6 @@ static const int NUM_CYCLE_PAGES = 5;  // Settings excluded from the cycle
 
 static Page currentPage = PAGE_NOW;
 
-// Simulated "current condition" for this demo -- in the real system this
-// comes from the server (Phase 1+). Fixed here so navigation can be
-// exercised against a stable alert state. Change 0/1/2 to try the others.
-static int simulatedCondition = 1;  // 0=clear, 1=lightning, 2=warning
-                                     // NOTE: still drives the persistent
-                                     // strip + the four secondary pages,
-                                     // which aren't wired to real data yet.
-                                     // Only the Now page uses real state below.
 
 // ---- Real fetched conditions (all five screens use this now) ----
 bool tempestAvailable = false;
@@ -64,6 +62,7 @@ String nwsFirstAlertExpires = "";
 String nwsFirstAlertInstruction = "";
 
 bool hasEverFetchedSuccessfully = false;
+bool timeSynced = false;  // set by syncTimeNTP(), defined near connectWiFi()
 bool lastFetchSucceeded = false;  // distinct from the above -- this can
                                     // flip back to false if the backend
                                     // goes down AFTER working once; used
@@ -221,10 +220,12 @@ void drawNwsFooterUnknown() {
 }
 
 void drawNowPage() {
-  // Real clock needs NTP (a later step) -- placeholder until then.
-  // Everything else on this page now reflects real fetched data.
+  // Real clock now comes from NTP sync (syncTimeNTP(), called once at
+  // boot) -- shows "--:--" if sync never succeeded, same placeholder as
+  // before that was purely hardcoded.
   String ageStr = formatAgeString();
-  drawCommonHeader("--:--", ageStr.c_str());
+  String timeStr = formatCurrentTime();
+  drawCommonHeader(timeStr.c_str(), ageStr.c_str());
 
   M5.Display.setTextDatum(top_left);
   if (!tempestAvailable) {
@@ -276,24 +277,30 @@ void drawPersistentStrip() {
   const int stripY = 214;
   const int stripH = 26;
   uint16_t bg, textColor;
-  const char *msg;
+  String msg;
 
-  switch (simulatedCondition) {
-    case 1:
-      bg = COLOR_LIGHTNING_BG;
-      textColor = COLOR_LIGHTNING_TEXT;
-      msg = "Lightning nearby";
-      break;
-    case 2:
-      bg = COLOR_WARNING_BG;
-      textColor = COLOR_WARNING_TEXT_HEADLINE;
-      msg = "SEVERE T-STORM WARNING";
-      break;
-    default:
-      bg = COLOR_BG;
-      textColor = COLOR_NWS_CLEAR_TEXT;
-      msg = "No active alerts";
-      break;
+  // Priority order when more than one thing is true at once: an active
+  // NWS alert outranks a local lightning event, matching the "official
+  // alerts are more urgent than local sensor events" principle used
+  // elsewhere in this project. NWS-unreachable gets its own neutral
+  // state too, for the same reason the Now screen and NWS Alerts page
+  // both distinguish it from a genuine "clear".
+  if (nwsAlertCount > 0) {
+    bg = COLOR_WARNING_BG;
+    textColor = COLOR_WARNING_TEXT_HEADLINE;
+    msg = nwsFirstAlertEvent;
+  } else if (lightningActive) {
+    bg = COLOR_LIGHTNING_BG;
+    textColor = COLOR_LIGHTNING_TEXT;
+    msg = (lightningLevel == "frequent") ? "Frequent lightning nearby" : "Lightning nearby";
+  } else if (!nwsAvailable) {
+    bg = COLOR_BG;
+    textColor = COLOR_TEXT_DIM;
+    msg = "NWS status unknown";
+  } else {
+    bg = COLOR_BG;
+    textColor = COLOR_NWS_CLEAR_TEXT;
+    msg = "No active alerts";
   }
 
   M5.Display.fillRect(0, stripY, 320, stripH, bg);
@@ -603,13 +610,15 @@ void drawStatusPage() {
   String backendValue = lastFetchSucceeded ? "Reachable" : "Unreachable";
   uint16_t backendDotColor = lastFetchSucceeded ? COLOR_NWS_CLEAR_DOT : COLOR_STATUS_BAD;
 
-  // Time sync: still dummy -- genuinely needs the NTP step, not built yet.
+  String timeSyncValue = timeSynced ? "OK (NTP)" : "Not synced";
+  uint16_t timeSyncDotColor = timeSynced ? COLOR_NWS_CLEAR_DOT : COLOR_STATUS_BAD;
+
   struct StatusRow { const char *label; String value; uint16_t dotColor; };
   StatusRow rows[4] = {
     {"Wi-Fi",      wifiValue,             wifiDotColor},
     {"Backend",    backendValue,          backendDotColor},
     {"Last sync",  formatAgeString(),     COLOR_NWS_CLEAR_DOT},
-    {"Time sync",  "Not yet built",       COLOR_TEXT_DIM},
+    {"Time sync",  timeSyncValue,         timeSyncDotColor},
   };
 
   int y = 52;
@@ -710,7 +719,80 @@ void connectWiFi() {
   }
 }
 
-// Phase 2c: HTTP fetch + JSON parse, now populating real state that
+// Phase 2f: NTP time sync. Uses the POSIX TZ-string form (configTzTime)
+// rather than the simpler fixed-UTC-offset form, specifically so US
+// Eastern daylight saving transitions (2nd Sunday in March, 1st Sunday
+// in November, per current US rule) are handled automatically by the C
+// library instead of needing a manual seasonal flip twice a year.
+// Not compiled/tested by me (same caveat as always for firmware) --
+// configTzTime is a real, documented ESP32 Arduino-core function, but
+// that's a statement about how standard the API is, not proof this
+// exact call succeeds on real hardware.
+const char *TZ_STRING = "EST5EDT,M3.2.0,M11.1.0";
+const char *NTP_SERVER = "pool.ntp.org";
+const unsigned long NTP_SYNC_TIMEOUT_MS = 15000;
+const time_t NTP_SANITY_THRESHOLD = 1577836800;  // 2020-01-01, roughly --
+                                                   // anything before this
+                                                   // means sync hasn't
+                                                   // happened yet (ESP32's
+                                                   // clock defaults to
+                                                   // epoch ~1970 at boot)
+
+void syncTimeNTP() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[ntp] Skipped -- Wi-Fi not connected");
+    return;
+  }
+
+  Serial.println("[ntp] Requesting time sync...");
+  configTzTime(TZ_STRING, NTP_SERVER);
+
+  unsigned long startAttempt = millis();
+  time_t now = time(nullptr);
+  while (now < NTP_SANITY_THRESHOLD && millis() - startAttempt < NTP_SYNC_TIMEOUT_MS) {
+    delay(300);
+    Serial.print(".");
+    now = time(nullptr);
+  }
+  Serial.println();
+
+  if (now >= NTP_SANITY_THRESHOLD) {
+    timeSynced = true;
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &timeinfo);
+    Serial.printf("[ntp] Synced! Current local time: %s\n", buf);
+  } else {
+    timeSynced = false;
+    Serial.println("[ntp] Sync FAILED (timed out after 15s). Clock will show --:--.");
+  }
+}
+
+// NOTE: this is a one-time sync at boot, not a repeating one. The
+// underlying ESP-IDF SNTP client is assumed to continue periodic
+// background resync on its own once started, matching how most SNTP
+// implementations behave by default -- but this is an ASSUMPTION, not
+// something confirmed via extended runtime testing (would need days of
+// uptime to check whether the clock stays accurate, or drifts).
+
+String formatCurrentTime() {
+  if (!timeSynced) {
+    return "--:--";
+  }
+  time_t now = time(nullptr);
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+  char buf[16];
+  strftime(buf, sizeof(buf), "%I:%M %p", &timeinfo);
+  String result(buf);
+  // Strip a leading zero from the hour (e.g. "09:15 PM" -> "9:15 PM"),
+  // matching the style already used in the approved mockups.
+  if (result.charAt(0) == '0') {
+    result = result.substring(1);
+  }
+  return result;
+}
 // drawNowPage() actually renders, called on a repeating 60s timer from
 // loop() rather than once at boot.
 //
@@ -813,6 +895,7 @@ void setup() {
   Serial.println("Tap to advance page. Long-press (~1s) for Settings.");
 
   connectWiFi();
+  syncTimeNTP();
   fetchConditions();
   lastFetchAttemptMillis = millis();
 
