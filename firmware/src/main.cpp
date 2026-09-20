@@ -36,6 +36,60 @@ static Page currentPage = PAGE_NOW;
 // comes from the server (Phase 1+). Fixed here so navigation can be
 // exercised against a stable alert state. Change 0/1/2 to try the others.
 static int simulatedCondition = 1;  // 0=clear, 1=lightning, 2=warning
+                                     // NOTE: still drives the persistent
+                                     // strip + the four secondary pages,
+                                     // which aren't wired to real data yet.
+                                     // Only the Now page uses real state below.
+
+// ---- Real fetched conditions (Now page only, this pass) ----
+bool tempestAvailable = false;
+float tempestTempF = 0;
+float tempestHumidityPct = 0;
+float tempestWindMph = 0;
+float tempestGustMph = 0;
+float tempestRainIn = 0;
+String tempestWindDir = "";
+
+bool lightningActive = false;
+String lightningLevel = "none";
+
+bool nwsAvailable = false;
+int nwsAlertCount = 0;
+String nwsFirstAlertEvent = "";
+String nwsFirstAlertExpires = "";
+
+bool hasEverFetchedSuccessfully = false;
+unsigned long lastSuccessfulFetchMillis = 0;
+
+const unsigned long FETCH_INTERVAL_MS = 60000;  // 60s -- matches obs_st's
+                                                  // own real-world cadence;
+                                                  // polling faster wouldn't
+                                                  // surface newer data
+unsigned long lastFetchAttemptMillis = 0;
+
+String formatAgeString() {
+  if (!hasEverFetchedSuccessfully) {
+    return "no data yet";
+  }
+  unsigned long elapsedSec = (millis() - lastSuccessfulFetchMillis) / 1000;
+  if (elapsedSec < 60) {
+    return String(elapsedSec) + "s ago";
+  }
+  return String(elapsedSec / 60) + "m ago";
+}
+
+String extractTimeFromIso(const String &iso) {
+  // Crude substring extraction, e.g. "2026-09-20T21:45:00-04:00" -> "21:45".
+  // NWS already returns this in the correct local offset, so no timezone
+  // math is needed -- just not converted to 12-hour AM/PM format yet.
+  // Placeholder until real time handling (NTP, a later step) exists;
+  // genuinely untested against a real alert since none has occurred.
+  int tIndex = iso.indexOf('T');
+  if (tIndex == -1 || (int)iso.length() < tIndex + 6) {
+    return "unknown time";
+  }
+  return iso.substring(tIndex + 1, tIndex + 6);
+}
 
 static const unsigned long LONG_PRESS_MS = 1000;
 static const unsigned long IDLE_RETURN_MS = 45000;
@@ -110,44 +164,82 @@ void drawNwsFooterClear() {
   M5.Display.drawString("NO ACTIVE ALERTS", 34, 204);
 }
 
-void drawLightningBanner() {
+void drawLightningBanner(const String &levelText) {
   M5.Display.fillRoundRect(12, 150, 296, 34, 6, COLOR_LIGHTNING_BG);
   M5.Display.drawRoundRect(12, 150, 296, 34, 6, COLOR_LIGHTNING_BORDER);
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextColor(COLOR_LIGHTNING_TEXT, COLOR_LIGHTNING_BG);
   M5.Display.setTextSize(2);
-  M5.Display.drawString("Lightning nearby", 26, 158);
+  M5.Display.drawString(levelText, 26, 158);
 }
 
-void drawNwsWarningFooter() {
+void drawNwsWarningFooter(const String &eventText, const String &untilText) {
   M5.Display.fillRect(0, 196, 320, 44, COLOR_WARNING_BG);
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextColor(COLOR_WARNING_TEXT_HEADLINE, COLOR_WARNING_BG);
   M5.Display.setTextSize(2);
-  M5.Display.drawString("SEVERE T-STORM WARNING", 16, 202);
+  M5.Display.drawString(eventText, 16, 202);
   M5.Display.setTextSize(1);
   M5.Display.setTextColor(COLOR_WARNING_TEXT_DETAIL, COLOR_WARNING_BG);
-  M5.Display.drawString("Until 11:45 PM -- tap for details", 16, 224);
+  M5.Display.drawString(untilText, 16, 224);
+}
+
+void drawNwsFooterUnknown() {
+  // Distinct from both "clear" (green) and "warning" (red), per the
+  // project's own core guardrail: NWS being unreachable must NEVER be
+  // shown as "NO ACTIVE ALERTS" -- that string is reserved for a real,
+  // fresh, successful check. Neutral gray, not calming, not urgent.
+  M5.Display.drawFastHLine(0, 194, 320, COLOR_SEPARATOR);
+  M5.Display.fillCircle(20, 212, 4, COLOR_TEXT_DIM);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+  M5.Display.setTextSize(2);
+  M5.Display.drawString("NWS STATUS UNKNOWN", 34, 204);
 }
 
 void drawNowPage() {
-  switch (simulatedCondition) {
-    case 0:
-      drawCommonHeader("10:47 PM", "updated 2m ago");
-      drawConditions("73F", "feels 74F", "78% humidity", "Wind 4 mph", "Gust 9 mph", "Rain 0.00\"");
-      drawNwsFooterClear();
-      break;
-    case 1:
-      drawCommonHeader("10:52 PM", "updated 1m ago");
-      drawConditions("72F", "feels 73F", "81% humidity", "Wind 6 mph", "Gust 14 mph", "Rain 0.02\"");
-      drawLightningBanner();
-      drawNwsFooterClear();
-      break;
-    case 2:
-      drawCommonHeader("11:03 PM", "updated 30s ago");
-      drawConditions("70F", "feels 71F", "85% humidity", "Wind 18 mph", "Gust 41 mph", "Rain 0.31\"");
-      drawNwsWarningFooter();
-      break;
+  // Real clock needs NTP (a later step) -- placeholder until then.
+  // Everything else on this page now reflects real fetched data.
+  String ageStr = formatAgeString();
+  drawCommonHeader("--:--", ageStr.c_str());
+
+  M5.Display.setTextDatum(top_left);
+  if (!tempestAvailable) {
+    // Distinct "no data" state -- never show zeros as if they were real.
+    M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+    M5.Display.setTextSize(2);
+    const char *msg = hasEverFetchedSuccessfully
+                           ? "Tempest data unavailable"
+                           : "Waiting for first data...";
+    M5.Display.drawString(msg, 16, 60);
+  } else {
+    char tempStr[8], humidStr[20], windStr[20], gustStr[20], rainStr[16];
+    snprintf(tempStr, sizeof(tempStr), "%.0fF", tempestTempF);
+    snprintf(humidStr, sizeof(humidStr), "%.0f%% humidity", tempestHumidityPct);
+    snprintf(windStr, sizeof(windStr), "Wind %.0f mph", tempestWindMph);
+    snprintf(gustStr, sizeof(gustStr), "Gust %.0f mph", tempestGustMph);
+    snprintf(rainStr, sizeof(rainStr), "Rain %.2f\"", tempestRainIn);
+    // No feels-like calculation exists server-side yet (a known,
+    // already-documented gap) -- left blank rather than showing a made-up
+    // value. Humidity still shows on its own line below it.
+    drawConditions(tempStr, "", humidStr, windStr, gustStr, rainStr);
+  }
+
+  if (lightningActive) {
+    String bannerText = (lightningLevel == "frequent")
+                             ? "Frequent lightning nearby"
+                             : "Lightning nearby";
+    drawLightningBanner(bannerText);
+  }
+
+  if (!nwsAvailable) {
+    drawNwsFooterUnknown();
+  } else if (nwsAlertCount > 0) {
+    String untilText = "Until " + extractTimeFromIso(nwsFirstAlertExpires) +
+                        " -- tap for details";
+    drawNwsWarningFooter(nwsFirstAlertEvent, untilText);
+  } else {
+    drawNwsFooterClear();
   }
 }
 
@@ -520,21 +612,24 @@ void connectWiFi() {
   }
 }
 
-// Phase 2b: one HTTP fetch + JSON parse, printed to serial only -- no
-// screen changes yet, and not on a repeating timer yet either. Purpose
-// is narrowly to prove the device can reach the real server and parse
-// its actual response shape, before wiring any of it into the UI.
+// Phase 2c: HTTP fetch + JSON parse, now populating real state that
+// drawNowPage() actually renders, called on a repeating 60s timer from
+// loop() rather than once at boot.
 //
-// Uses ArduinoJson v7 (pinned in platformio.ini) -- its JsonDocument
-// class doesn't need a compile-time capacity like v6's StaticJsonDocument
-// did. Not compiled/tested by me (same sandbox limitation as always for
-// firmware); ArduinoJson's basic deserialize+access pattern is about as
-// standard as this ecosystem gets, but "standard" isn't "verified on
-// real hardware" -- treat this the same as everything else that needs
-// a real build to confirm.
+// Uses ArduinoJson v7 (pinned in platformio.ini). Not compiled/tested by
+// me (same sandbox limitation as always for firmware) -- treat this the
+// same as everything else that needs a real build to confirm.
+//
+// KNOWN LIMITATION, not yet addressed: http.GET() blocks the main loop
+// for its duration. On a healthy local-LAN request this is well under a
+// second and unnoticeable, but if the server becomes unreachable, this
+// could cause a brief (multi-second) pause in touch responsiveness once
+// every 60s until the request times out. Proper non-blocking HTTP is
+// real added complexity, deliberately deferred to the failure-state-
+// handling pass rather than solved here.
 const char *SERVER_URL = "http://192.168.6.29:8085/api/conditions";
 
-void fetchConditionsOnce() {
+void fetchConditions() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[fetch] Skipped -- Wi-Fi not connected");
     return;
@@ -563,23 +658,38 @@ void fetchConditionsOnce() {
     return;
   }
 
-  bool tempestAvailable = doc["tempest"]["available"];
-  Serial.printf("[fetch] tempest.available = %s\n", tempestAvailable ? "true" : "false");
+  tempestAvailable = doc["tempest"]["available"];
   if (tempestAvailable) {
-    float tempF = doc["tempest"]["temperature_f"];
-    float windMph = doc["tempest"]["wind_mph"];
-    const char *windDir = doc["tempest"]["wind_direction"];
-    Serial.printf("[fetch]   temperature_f=%.1f  wind_mph=%.1f  dir=%s\n",
-                  tempF, windMph, windDir);
+    tempestTempF = doc["tempest"]["temperature_f"];
+    tempestHumidityPct = doc["tempest"]["humidity_percent"];
+    tempestWindMph = doc["tempest"]["wind_mph"];
+    tempestGustMph = doc["tempest"]["gust_mph"];
+    tempestRainIn = doc["tempest"]["rain_this_interval_in"];
+    tempestWindDir = doc["tempest"]["wind_direction"].as<String>();
   }
 
-  const char *lightningLevel = doc["lightning"]["level"];
-  Serial.printf("[fetch] lightning.level = %s\n", lightningLevel);
+  lightningActive = doc["lightning"]["active"];
+  lightningLevel = doc["lightning"]["level"].as<String>();
 
-  bool nwsAvailable = doc["nws"]["available"];
-  int alertCount = doc["nws"]["alerts"].size();
-  Serial.printf("[fetch] nws.available = %s, alert count = %d\n",
-                nwsAvailable ? "true" : "false", alertCount);
+  nwsAvailable = doc["nws"]["available"];
+  JsonArray alerts = doc["nws"]["alerts"];
+  nwsAlertCount = alerts.size();
+  if (nwsAlertCount > 0) {
+    nwsFirstAlertEvent = alerts[0]["event"].as<String>();
+    nwsFirstAlertExpires = alerts[0]["expires"].as<String>();
+  } else {
+    nwsFirstAlertEvent = "";
+    nwsFirstAlertExpires = "";
+  }
+
+  hasEverFetchedSuccessfully = true;
+  lastSuccessfulFetchMillis = millis();
+
+  Serial.printf("[fetch] State updated -- tempest.available=%s temp=%.1f wind=%.1f dir=%s\n",
+                tempestAvailable ? "true" : "false", tempestTempF, tempestWindMph,
+                tempestWindDir.c_str());
+  Serial.printf("[fetch]   lightning.level=%s  nws.available=%s  alerts=%d\n",
+                lightningLevel.c_str(), nwsAvailable ? "true" : "false", nwsAlertCount);
 }
 
 void setup() {
@@ -593,7 +703,8 @@ void setup() {
   Serial.println("Tap to advance page. Long-press (~1s) for Settings.");
 
   connectWiFi();
-  fetchConditionsOnce();
+  fetchConditions();
+  lastFetchAttemptMillis = millis();
 
   initColors();
   lastActivityTime = millis();
@@ -641,6 +752,18 @@ void loop() {
     currentPage = PAGE_NOW;
     lastActivityTime = millis();
     renderPage(currentPage);
+  }
+
+  // Periodic re-fetch of real conditions. Only redraws if Now is
+  // currently being shown -- doesn't interrupt whatever detail page
+  // someone might be reading, even though the underlying data still
+  // updates regardless, ready for whenever they cycle back to Now.
+  if (millis() - lastFetchAttemptMillis >= FETCH_INTERVAL_MS) {
+    lastFetchAttemptMillis = millis();
+    fetchConditions();
+    if (currentPage == PAGE_NOW) {
+      renderPage(PAGE_NOW);
+    }
   }
 
   delay(10);
