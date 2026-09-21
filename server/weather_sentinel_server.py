@@ -43,6 +43,7 @@ Then from any machine on the LAN:
 """
 
 import os
+import re
 import socket
 import json
 import time
@@ -363,6 +364,103 @@ LEVEL_RANK = {
 }
 
 
+# --- "What is actually happening": short, bounded text for the device. ---
+# The device shows WHAT (NWS's own one-line headline, minus its time
+# phrase) and HAZARD (the "HAZARD..." / "* WHAT..." line NWS writes into
+# the product body), so an alert reads "A strong thunderstorm ... / Wind
+# gusts up to 50 mph" instead of only an event name and a generic
+# instruction. Extraction is best-effort and must NEVER raise: this runs
+# on untrusted external text inside the poller, and an exception there
+# would silently stop alert updates.
+WHAT_MAX_CHARS = 140
+HAZARD_MAX_CHARS = 100
+
+# Just the time phrase ("through 430 PM EDT", "until 8 PM EDT this evening"),
+# wherever it sits -- whatever follows it (e.g. "FOR PORTIONS OF GEORGIA")
+# is kept.
+_TIME_PHRASE = re.compile(
+    r"\s+(?:through|until|til|till)\s+\d{1,2}(?::?\d{2})?\s*[ap]\.?m\.?\s+[a-z]{3,4}\b"
+    r"(?:\s+(?:this\s+)?(?:morning|afternoon|evening|night|tonight|today|sunday|monday|tuesday|wednesday|thursday|friday|saturday))?",
+    re.IGNORECASE)
+# Terminates a body paragraph at a blank line, at the next "* BULLET", or
+# at the next ALL-CAPS label such as "WHERE..." (case-sensitive on purpose,
+# so ordinary sentences like "Locations impacted include..." never match).
+_PARA_END = r"(?:\n[ \t]*\n|\n[ \t]*\*|\n[ \t]*(?-i:[A-Z][A-Z ]{2,20}\.\.\.)|\Z)"
+_HAZARD_RE = re.compile(r"^[ \t]*\*?[ \t]*HAZARD\.\.\.(.*?)" + _PARA_END, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+_WHAT_RE = re.compile(r"^[ \t]*\*?[ \t]*WHAT\.\.\.(.*?)" + _PARA_END, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+
+
+def _squash(text):
+    """Collapse every run of whitespace (including the hard line breaks
+    NWS inserts at ~69 columns) to a single space."""
+    return re.sub(r"\s+", " ", text).strip() if isinstance(text, str) else ""
+
+
+def _bound(text, limit):
+    """Trim to `limit` characters at a word boundary, marking the cut."""
+    text = _squash(text)
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 3]
+    space = cut.rfind(" ")
+    if space > limit * 0.5:
+        cut = cut[:space]
+    return cut.rstrip(" ,;:-") + "..."
+
+
+def extract_reason_fields(props):
+    """Returns (what, hazard) -- either may be None. Never raises."""
+    try:
+        event = _squash(props.get("event"))
+        description = props.get("description")
+        description = description if isinstance(description, str) else ""
+
+        # HAZARD: "HAZARD..." (warnings, statements) or "* WHAT..." (watches,
+        # advisories, and NWS's newer plain-language format).
+        hazard = None
+        for pattern in (_HAZARD_RE, _WHAT_RE):
+            m = pattern.search(description)
+            if m:
+                hazard = _bound(m.group(1), HAZARD_MAX_CHARS) or None
+                break
+
+        # WHAT: NWS's own headline, without its trailing time phrase (the
+        # device already shows "Until ...").
+        params = props.get("parameters")
+        raw_headline = None
+        if isinstance(params, dict):
+            values = params.get("NWSheadline")
+            if isinstance(values, list) and values and isinstance(values[0], str):
+                raw_headline = values[0]
+        what = _squash(raw_headline)
+        what = re.sub(r"^\.{2,}\s*|\s*\.{2,}$", "", what).strip()
+        stripped = _TIME_PHRASE.sub("", what, count=1).strip()
+        if len(stripped) >= 12:
+            what = stripped
+
+        # No headline at all: fall back to the product's first paragraph,
+        # unless that paragraph is itself a labelled section (which is what
+        # the HAZARD slot already carries).
+        if not what and description.strip():
+            first_par = re.split(r"\n[ \t]*\n", description.strip(), maxsplit=1)[0]
+            if not re.match(r"^\s*\*?\s*(HAZARD|WHAT|WHERE|WHEN|IMPACTS?)\.\.\.", first_par, re.IGNORECASE):
+                what = _squash(first_par)
+
+        what = _bound(what, WHAT_MAX_CHARS)
+
+        # A headline that merely repeats the event name ("Heat Advisory
+        # remains in effect") adds nothing next to the event line.
+        if what and event and what.lower().startswith(event.lower()) and len(what) <= len(event) + 25:
+            what = ""
+        if what and hazard and what.lower() == hazard.lower():
+            what = ""
+
+        return (what or None), hazard
+    except Exception as e:  # noqa: BLE001 -- see docstring
+        print(f"[nws] could not extract reason fields: {e!r}", flush=True)
+        return None, None
+
+
 def classify_level(props):
     event = (props.get("event") or "").lower()
     severity = props.get("severity") or "Unknown"
@@ -398,6 +496,7 @@ def process_nws_alerts_locked(raw_props_list):
             continue
         current_ids.add(alert_id)
         level = classify_level(props)
+        what, hazard = extract_reason_fields(props)
 
         if alert_id not in tracked_alerts:
             tracked_alerts[alert_id] = {
@@ -410,6 +509,8 @@ def process_nws_alerts_locked(raw_props_list):
                 "expires": props.get("expires"),
                 "headline": props.get("headline"),
                 "instruction": props.get("instruction"),
+                "what": what,
+                "hazard": hazard,
                 "level": level,
                 "acknowledged": False,
                 "last_transition": "new",
@@ -425,6 +526,8 @@ def process_nws_alerts_locked(raw_props_list):
             or existing["headline"] != props.get("headline")
             or existing["instruction"] != props.get("instruction")
             or existing["expires"] != props.get("expires")
+            or existing.get("what") != what
+            or existing.get("hazard") != hazard
             or old_level != level
         )
 
@@ -447,6 +550,8 @@ def process_nws_alerts_locked(raw_props_list):
         existing["expires"] = props.get("expires")
         existing["headline"] = props.get("headline")
         existing["instruction"] = props.get("instruction")
+        existing["what"] = what
+        existing["hazard"] = hazard
         existing["level"] = level
         existing["last_updated_at"] = now_iso
 
@@ -523,6 +628,15 @@ def poll_nws_once():
         with state_lock:
             latest_nws["available"] = False
         print(f"[nws] Poll FAILED: {e} -- marked unavailable, will retry next cycle")
+
+    except Exception as e:  # noqa: BLE001
+        # Anything unexpected while processing a poll (odd data from NWS, a
+        # bug in parsing) must not kill this thread: alert updates would
+        # silently stop while the device kept showing stale "all clear".
+        # Mark NWS unavailable so the device says "unknown", and keep going.
+        with state_lock:
+            latest_nws["available"] = False
+        print(f"[nws] Poll processing ERROR: {e!r} -- marked unavailable, will retry next cycle", flush=True)
 
 
 def nws_poller_thread():

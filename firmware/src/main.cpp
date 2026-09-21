@@ -71,6 +71,8 @@ String nwsFirstAlertEvent = "";
 String nwsFirstAlertExpires = "";
 String nwsFirstAlertInstruction = "";
 String nwsFirstAlertId = "";
+String nwsFirstAlertWhat = "";     // NWS's one-line headline, minus its time phrase
+String nwsFirstAlertHazard = "";   // the "HAZARD..." / "WHAT..." line
 bool nwsFirstAlertAcknowledged = false;
 bool nwsFirstAlertNeedsAlert = false;
 
@@ -799,6 +801,103 @@ int layoutInstruction(const String &raw, String lines[], int &textSize,
   return n;
 }
 
+// ---- NWS page body: WHAT'S HAPPENING / HAZARD / INSTRUCTION ----
+// (Approved layout "B".) Text is laid out by a pure function into a list
+// of positioned lines, so the geometry can be tested for overflow and
+// overlap without a display. Priority when space is tight: HAZARD is
+// always kept, INSTRUCTION keeps at least 3 lines, and WHAT'S HAPPENING
+// gets whatever remains (up to 3 lines) or is omitted.
+const int NWS_BODY_TOP = 90;
+const int NWS_BODY_BOTTOM = 212;        // the strip / acknowledge bar starts at y=214
+const int NWS_SECTION_GAP = 4;
+const int NWS_LABEL_H = 10;             // size-1 label line
+const int NWS_INSTR_MIN_LINES = 3;
+const int NWS_MAX_PAGE_LINES = 24;
+
+enum LineRole { ROLE_LABEL = 0, ROLE_WHAT, ROLE_HAZARD, ROLE_INSTRUCTION };
+struct PageLine {
+  int y;
+  int size;
+  LineRole role;
+  String text;
+};
+
+// Returns the number of lines placed in `out` (capacity NWS_MAX_PAGE_LINES),
+// or 0 if the alert has neither WHAT nor HAZARD text -- the caller then
+// uses the instruction-only layout, exactly as before.
+int layoutAlertBody(const String &whatIn, const String &hazardIn, const String &instrIn,
+                    PageLine out[]) {
+  String what = collapseWhitespace(whatIn);
+  String hazard = collapseWhitespace(hazardIn);
+  String instr = collapseWhitespace(instrIn);
+  if (what.length() == 0 && hazard.length() == 0) return 0;
+
+  int n = 0;
+  bool truncated = false;
+
+  // HAZARD: large (2 lines) if it fits, else small (3 lines).
+  String hazardLines[3];
+  int hazardCount = 0, hazardSize = 2, hazardLineH = 16;
+  if (hazard.length() > 0) {
+    hazardCount = wrapInstructionText(hazard, hazardLines, 2, NWS_LINE_CHARS_LARGE, truncated);
+    if (truncated) {
+      hazardSize = 1;
+      hazardLineH = 10;
+      hazardCount = wrapInstructionText(hazard, hazardLines, 3, NWS_LINE_CHARS_SMALL, truncated);
+    }
+  }
+
+  // Space left for WHAT after reserving HAZARD and a minimum INSTRUCTION.
+  int total = NWS_BODY_BOTTOM - NWS_BODY_TOP;
+  int hazardBlock = hazardCount ? NWS_LABEL_H + hazardCount * hazardLineH : 0;
+  int instrMinBlock = instr.length() ? NWS_LABEL_H + NWS_INSTR_MIN_LINES * 10 : 0;
+  int laterSections = (hazardCount ? 1 : 0) + (instr.length() ? 1 : 0);
+  int reserved = hazardBlock + instrMinBlock + laterSections * NWS_SECTION_GAP;
+  int whatLinesAllowed = (total - reserved - NWS_LABEL_H) / 10;
+  if (whatLinesAllowed > 3) whatLinesAllowed = 3;
+
+  String whatLines[3];
+  int whatCount = 0;
+  if (what.length() > 0 && whatLinesAllowed >= 1) {
+    whatCount = wrapInstructionText(what, whatLines, whatLinesAllowed, NWS_LINE_CHARS_SMALL, truncated);
+  }
+
+  int y = NWS_BODY_TOP;
+  if (whatCount > 0) {
+    out[n].y = y; out[n].size = 1; out[n].role = ROLE_LABEL; out[n].text = "WHAT'S HAPPENING"; n++;
+    y += NWS_LABEL_H;
+    for (int i = 0; i < whatCount; i++) {
+      out[n].y = y; out[n].size = 1; out[n].role = ROLE_WHAT; out[n].text = whatLines[i]; n++;
+      y += 10;
+    }
+    y += NWS_SECTION_GAP;
+  }
+  if (hazardCount > 0) {
+    out[n].y = y; out[n].size = 1; out[n].role = ROLE_LABEL; out[n].text = "HAZARD"; n++;
+    y += NWS_LABEL_H;
+    for (int i = 0; i < hazardCount; i++) {
+      out[n].y = y; out[n].size = hazardSize; out[n].role = ROLE_HAZARD; out[n].text = hazardLines[i]; n++;
+      y += hazardLineH;
+    }
+    y += NWS_SECTION_GAP;
+  }
+  if (instr.length() > 0) {
+    int lines = (NWS_BODY_BOTTOM - (y + NWS_LABEL_H)) / 10;
+    if (lines > NWS_LINES_SMALL) lines = NWS_LINES_SMALL;
+    if (lines >= 1) {
+      String instrLines[NWS_LINES_SMALL];
+      int instrCount = wrapInstructionText(instr, instrLines, lines, NWS_LINE_CHARS_SMALL, truncated);
+      out[n].y = y; out[n].size = 1; out[n].role = ROLE_LABEL; out[n].text = "INSTRUCTION"; n++;
+      y += NWS_LABEL_H;
+      for (int i = 0; i < instrCount; i++) {
+        out[n].y = y; out[n].size = 1; out[n].role = ROLE_INSTRUCTION; out[n].text = instrLines[i]; n++;
+        y += 10;
+      }
+    }
+  }
+  return n;
+}
+
 void drawNwsAlertsPage() {
   drawSecondaryHeader("NWS Alerts", PAGE_NWS_ALERTS);
 
@@ -853,6 +952,25 @@ void drawNwsAlertsPage() {
   // Instruction: full official text, word-wrapped and truncated with an
   // indicator if it runs longer than the available space. Now using the
   // real instruction text from the active alert.
+  // Approved layout B: WHAT'S HAPPENING / HAZARD / INSTRUCTION, when the
+  // server supplied a headline or hazard for this alert.
+  PageLine pageLines[NWS_MAX_PAGE_LINES];
+  int pageLineCount = layoutAlertBody(nwsFirstAlertWhat, nwsFirstAlertHazard,
+                                      nwsFirstAlertInstruction, pageLines);
+  if (pageLineCount > 0) {
+    for (int i = 0; i < pageLineCount; i++) {
+      uint16_t color = COLOR_TEXT_SECONDARY;
+      if (pageLines[i].role == ROLE_LABEL) color = COLOR_TEXT_DIM;
+      else if (pageLines[i].role == ROLE_HAZARD) color = COLOR_TEXT_PRIMARY;
+      M5.Display.setTextColor(color, COLOR_BG);
+      M5.Display.setTextSize(pageLines[i].size);
+      M5.Display.drawString(pageLines[i].text, 16, pageLines[i].y);
+    }
+    return;
+  }
+
+  // Otherwise (no headline/hazard from the server): the instruction-only
+  // layout, unchanged.
   M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
   M5.Display.setTextSize(1);
   M5.Display.drawString("INSTRUCTION", 16, 92);
@@ -1231,6 +1349,8 @@ void fetchConditions() {
     nwsFirstAlertExpires = alerts[0]["expires"] | "";
     nwsFirstAlertInstruction = alerts[0]["instruction"] | "";
     nwsFirstAlertId = alerts[0]["id"] | "";
+    nwsFirstAlertWhat = alerts[0]["what"] | "";
+    nwsFirstAlertHazard = alerts[0]["hazard"] | "";
     nwsFirstAlertAcknowledged = alerts[0]["acknowledged"];
     nwsFirstAlertNeedsAlert = alerts[0]["needs_alert"];
   } else {
@@ -1238,6 +1358,8 @@ void fetchConditions() {
     nwsFirstAlertExpires = "";
     nwsFirstAlertInstruction = "";
     nwsFirstAlertId = "";
+    nwsFirstAlertWhat = "";
+    nwsFirstAlertHazard = "";
     nwsFirstAlertAcknowledged = false;
     nwsFirstAlertNeedsAlert = false;
   }
