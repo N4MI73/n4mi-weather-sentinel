@@ -25,6 +25,7 @@
 // the rest of the NTP code, near connectWiFi()), but drawNowPage() above
 // that point needs to call it.
 String formatCurrentTime();
+String formatEpochLocal(long epoch);  // defined next to formatCurrentTime()
 
 enum Page {
   PAGE_NOW = 0,
@@ -45,14 +46,17 @@ float tempestTempF = 0;
 float tempestHumidityPct = 0;
 float tempestWindMph = 0;
 float tempestGustMph = 0;
-float tempestRainIn = 0;
+float tempestRainRateInHr = 0;     // WeatherFlow-style rate: latest minute x 60
+String tempestRainRateLevel = "";  // "none"/"very_light"/.../"extreme"; "" = not sent
+bool tempestFeelsLikeValid = false;
+float tempestFeelsLikeF = 0;
 float tempestPressureInHg = 0;
 String tempestWindDir = "";
 
 bool lightningActive = false;
 String lightningLevel = "none";
 float lightningClosestDistanceMi = 0;
-String lightningMostRecentAt = "";
+long lightningMostRecentEpoch = 0;  // seconds; 0 = none/unknown
 int lightningStrikeCountRecent = 0;
 
 bool nwsAvailable = false;
@@ -280,6 +284,26 @@ void drawNwsFooterUnknown() {
   M5.Display.drawString("NWS STATUS UNKNOWN", 34, 204);
 }
 
+// Tempest's rain-intensity words, from the server's rain_rate_level. An
+// unknown or missing level shows "--" rather than a guess.
+const char *rainLevelLabel(const String &level) {
+  if (level == "none") return "None";
+  if (level == "very_light") return "Very Light";
+  if (level == "light") return "Light";
+  if (level == "moderate") return "Moderate";
+  if (level == "heavy") return "Heavy";
+  if (level == "very_heavy") return "Very Heavy";
+  if (level == "extreme") return "Extreme";
+  return "--";
+}
+
+// Picks text size 3 if the string fits in maxWidth pixels, else size 2.
+// Deliberately conservative: assumes 6px-wide glyphs at size 1 (18px at
+// size 3), so it errs toward the smaller size rather than overflowing.
+int fitTextSize(const char *text, int maxWidth) {
+  return ((int)strlen(text) * 18 <= maxWidth) ? 3 : 2;
+}
+
 void drawNowPage() {
   // Real clock now comes from NTP sync (syncTimeNTP(), called once at
   // boot) -- shows "--:--" if sync never succeeded, same placeholder as
@@ -298,16 +322,23 @@ void drawNowPage() {
                            : "Waiting for first data...";
     M5.Display.drawString(msg, 16, 60);
   } else {
-    char tempStr[8], humidStr[20], windStr[20], gustStr[20], rainStr[16];
+    char tempStr[8], feelsStr[16], humidStr[20], windStr[20], gustStr[20], rainStr[28];
     snprintf(tempStr, sizeof(tempStr), "%.0fF", tempestTempF);
+    // Feels-like comes from the server (WeatherFlow's own definition). If
+    // the server didn't send one, the slot stays blank rather than
+    // showing a made-up number.
+    if (tempestFeelsLikeValid) {
+      snprintf(feelsStr, sizeof(feelsStr), "Feels %.0fF", tempestFeelsLikeF);
+    } else {
+      feelsStr[0] = '\0';
+    }
     snprintf(humidStr, sizeof(humidStr), "%.0f%% humidity", tempestHumidityPct);
     snprintf(windStr, sizeof(windStr), "Wind %.0f mph", tempestWindMph);
     snprintf(gustStr, sizeof(gustStr), "Gust %.0f mph", tempestGustMph);
-    snprintf(rainStr, sizeof(rainStr), "Rain %.2f\"", tempestRainIn);
-    // No feels-like calculation exists server-side yet (a known,
-    // already-documented gap) -- left blank rather than showing a made-up
-    // value. Humidity still shows on its own line below it.
-    drawConditions(tempStr, "", humidStr, windStr, gustStr, rainStr);
+    // What is happening NOW: the rain RATE in Tempest's own words, not an
+    // accumulation. Numeric detail lives on the Wind & Rain page.
+    snprintf(rainStr, sizeof(rainStr), "Rain: %s", rainLevelLabel(tempestRainRateLevel));
+    drawConditions(tempStr, feelsStr, humidStr, windStr, gustStr, rainStr);
   }
 
   if (currentLightningView() == LIGHTNING_ACTIVE) {
@@ -452,24 +483,30 @@ void drawWindRainPage() {
 
   M5.Display.drawFastHLine(16, 100, 288, COLOR_SEPARATOR);
 
-  // Row 2: rain. The server only reports rain for its own ~1-minute
-  // report interval, not a running daily total (a known, documented
-  // gap) -- labeled honestly as such rather than mislabeled "today".
-  // Rain rate isn't computed server-side at all yet -- shown as "--"
-  // rather than fabricated or duplicating the interval value.
-  char rainStr[16];
-  snprintf(rainStr, sizeof(rainStr), "%.2f\"", tempestRainIn);
+  // Row 2: rain RATE -- the Tempest word (None ... Extreme) plus the
+  // number in inches per hour. No daily accumulation yet (a known,
+  // documented gap), and none is implied here.
+  const char *rainWord = rainLevelLabel(tempestRainRateLevel);
+  char rateStr[16];
+  if (tempestRainRateLevel == "very_light") {
+    snprintf(rateStr, sizeof(rateStr), "<0.01 in/hr");   // rounds to 0.00 otherwise
+  } else if (tempestRainRateLevel == "") {
+    snprintf(rateStr, sizeof(rateStr), "--");
+  } else {
+    snprintf(rateStr, sizeof(rateStr), "%.2f in/hr", tempestRainRateInHr);
+  }
 
   M5.Display.setTextColor(COLOR_LABEL, COLOR_BG);
   M5.Display.setTextSize(1);
-  M5.Display.drawString("RAIN (LAST MIN)", 16, 110);
-  M5.Display.drawString("RAIN RATE", 170, 110);
+  M5.Display.drawString("RAIN NOW", 16, 110);
+  M5.Display.drawString("RATE", 170, 110);
 
   M5.Display.setTextColor(COLOR_TEXT_PRIMARY, COLOR_BG);
-  M5.Display.setTextSize(3);
-  M5.Display.drawString(rainStr, 16, 126);
-  M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
-  M5.Display.drawString("--", 170, 126);
+  M5.Display.setTextSize(fitTextSize(rainWord, 148));
+  M5.Display.drawString(rainWord, 16, 126);
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
+  M5.Display.drawString(rateStr, 170, 130);
 
   M5.Display.drawFastHLine(16, 162, 288, COLOR_SEPARATOR);
 
@@ -547,9 +584,9 @@ void drawLightningPage() {
     M5.Display.drawString(distStr, 16, 124);
     M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
     M5.Display.setTextSize(2);
-    // Crude time extraction, same placeholder approach as the NWS
-    // "until" time -- real relative-age formatting needs NTP.
-    M5.Display.drawString(extractTimeFromIso(lightningMostRecentAt), 130, 130);
+    // Local time via the same NTP/TZ path as the Now-screen clock. (The
+    // server's ISO string is UTC, which used to be shown as if local.)
+    M5.Display.drawString(formatEpochLocal(lightningMostRecentEpoch), 150, 130);
   } else {
     M5.Display.drawString(lv == LIGHTNING_UNKNOWN ? "--" : "None", 16, 124);
   }
@@ -906,6 +943,22 @@ void syncTimeNTP() {
 // something confirmed via extended runtime testing (would need days of
 // uptime to check whether the clock stays accurate, or drifts).
 
+String formatEpochLocal(long epoch) {
+  if (!timeSynced || epoch <= 0) {
+    return "--:--";
+  }
+  time_t t = (time_t)epoch;
+  struct tm timeinfo;
+  localtime_r(&t, &timeinfo);
+  char buf[16];
+  strftime(buf, sizeof(buf), "%I:%M %p", &timeinfo);
+  String result(buf);
+  if (result.charAt(0) == '0') {
+    result = result.substring(1);   // "09:15 PM" -> "9:15 PM", same as the clock
+  }
+  return result;
+}
+
 String formatCurrentTime() {
   if (!timeSynced) {
     return "--:--";
@@ -995,7 +1048,13 @@ void fetchConditions() {
     tempestHumidityPct = doc["tempest"]["humidity_percent"];
     tempestWindMph = doc["tempest"]["wind_mph"];
     tempestGustMph = doc["tempest"]["gust_mph"];
-    tempestRainIn = doc["tempest"]["rain_this_interval_in"];
+    tempestRainRateInHr = doc["tempest"]["rain_rate_in_hr"] | 0.0f;
+    tempestRainRateLevel = doc["tempest"]["rain_rate_level"] | "";
+    JsonVariant feelsLike = doc["tempest"]["feels_like_f"];
+    tempestFeelsLikeValid = !feelsLike.isNull();
+    if (tempestFeelsLikeValid) {
+      tempestFeelsLikeF = feelsLike.as<float>();
+    }
     tempestPressureInHg = doc["tempest"]["pressure_inhg_station"];
     tempestWindDir = doc["tempest"]["wind_direction"].as<String>();
   }
@@ -1004,7 +1063,7 @@ void fetchConditions() {
   lightningLevel = doc["lightning"]["level"].as<String>();
   if (lightningActive) {
     lightningClosestDistanceMi = doc["lightning"]["closest_distance_mi"];
-    lightningMostRecentAt = doc["lightning"]["most_recent_strike_at"].as<String>();
+    lightningMostRecentEpoch = doc["lightning"]["most_recent_strike_epoch"] | 0L;
     lightningStrikeCountRecent = doc["lightning"]["strike_count_recent"];
   }
 

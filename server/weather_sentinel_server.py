@@ -103,6 +103,53 @@ def iso_time(epoch):
     return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
 
 
+# --- Derived values, using WeatherFlow's own published definitions so the
+# device agrees with the Tempest app (weatherflow.github.io/SmartWeather/
+# api/derived-metric-formulas.html). ---
+
+def rain_rate_level(rate_mm_per_hr):
+    """Tempest's rain-intensity words. The rate is the latest one-minute
+    accumulation extrapolated to an hour, so it can change minute to
+    minute as showers come and go -- same as the app."""
+    if rate_mm_per_hr <= 0:
+        return "none"
+    if rate_mm_per_hr < 0.25:
+        return "very_light"
+    if rate_mm_per_hr < 1.0:
+        return "light"
+    if rate_mm_per_hr < 4.0:
+        return "moderate"
+    if rate_mm_per_hr < 16.0:
+        return "heavy"
+    if rate_mm_per_hr < 50.0:
+        return "very_heavy"
+    return "extreme"
+
+
+def heat_index_f(temp_f, rh_pct):
+    return (-42.379 + 2.04901523 * temp_f + 10.1433127 * rh_pct
+            - 0.22475541 * temp_f * rh_pct - 6.83783e-3 * temp_f ** 2
+            - 5.481717e-2 * rh_pct ** 2 + 1.22874e-3 * temp_f ** 2 * rh_pct
+            + 8.5282e-4 * temp_f * rh_pct ** 2
+            - 1.99e-6 * temp_f ** 2 * rh_pct ** 2)
+
+
+def wind_chill_f(temp_f, wind_mph):
+    v16 = wind_mph ** 0.16
+    return 35.74 + 0.6215 * temp_f - 35.75 * v16 + 0.4275 * temp_f * v16
+
+
+def feels_like_f(temp_f, rh_pct, wind_mph):
+    """WeatherFlow's rule: heat index at or above 80F and 40% RH; wind
+    chill at or below 50F with wind over 3 mph; otherwise the air
+    temperature itself."""
+    if temp_f >= 80 and rh_pct >= 40:
+        return heat_index_f(temp_f, rh_pct)
+    if temp_f <= 50 and wind_mph > 3:
+        return wind_chill_f(temp_f, wind_mph)
+    return temp_f
+
+
 # Shared state, protected by a lock since the UDP listener thread writes
 # to it and Flask's request-handling thread(s) read from it.
 state_lock = threading.Lock()
@@ -115,7 +162,11 @@ latest_conditions = {
     "gust_mph": None,
     "wind_direction": None,
     "pressure_inhg_station": None,  # NOT sea-level-adjusted -- deferred
-    "rain_this_interval_in": None,
+    "rain_this_interval_in": None,   # kept for compatibility; the device
+                                     # now uses rain_rate_* below instead
+    "rain_rate_in_hr": None,
+    "rain_rate_level": None,
+    "feels_like_f": None,
 }
 
 # When the last obs_st packet was RECEIVED, on this server's own monotonic
@@ -175,17 +226,31 @@ def handle_obs_st(msg):
         print(f"[udp] obs_st reports {obs[15]} strike(s) this interval, "
               f"avg distance {obs[14]} km ({float(obs[14]) * KM_TO_MI:.1f} mi)", flush=True)
 
+    # Compute everything first, from the RAW values, before touching shared
+    # state -- so a bad packet can't leave half-updated conditions behind,
+    # and so rain rate isn't computed from an already-rounded number
+    # (one minute of "light" rain is ~0.00016 in and would round to zero).
+    temp_f_raw = c_to_f(obs[7])
+    wind_mph_raw = obs[2] * MS_TO_MPH
+    rain_rate_mm_hr = obs[12] * 60.0   # last-minute accumulation -> per hour
+    computed = {
+        "observed_at": iso_time(obs[0]),
+        "wind_mph": round(wind_mph_raw, 1),
+        "gust_mph": round(obs[3] * MS_TO_MPH, 1),
+        "wind_direction": degrees_to_compass(obs[4]),
+        "pressure_inhg_station": round(obs[6] * MB_TO_INHG, 2),
+        "temperature_f": round(temp_f_raw, 1),
+        "humidity_percent": round(obs[8]),
+        "rain_this_interval_in": round(obs[12] * MM_TO_IN, 3),
+        "rain_rate_in_hr": round(rain_rate_mm_hr * MM_TO_IN, 2),
+        "rain_rate_level": rain_rate_level(rain_rate_mm_hr),
+        "feels_like_f": round(feels_like_f(temp_f_raw, obs[8], wind_mph_raw), 1),
+    }
+
     with state_lock:
         last_obs_received_monotonic = time.monotonic()
         latest_conditions["available"] = True
-        latest_conditions["observed_at"] = iso_time(obs[0])
-        latest_conditions["wind_mph"] = round(obs[2] * MS_TO_MPH, 1)
-        latest_conditions["gust_mph"] = round(obs[3] * MS_TO_MPH, 1)
-        latest_conditions["wind_direction"] = degrees_to_compass(obs[4])
-        latest_conditions["pressure_inhg_station"] = round(obs[6] * MB_TO_INHG, 2)
-        latest_conditions["temperature_f"] = round(c_to_f(obs[7]), 1)
-        latest_conditions["humidity_percent"] = round(obs[8])
-        latest_conditions["rain_this_interval_in"] = round(obs[12] * MM_TO_IN, 3)
+        latest_conditions.update(computed)
 
 
 def _prune_recent_strikes_locked():
@@ -235,6 +300,7 @@ def get_lightning_status():
                 "level": "none",
                 "closest_distance_mi": None,
                 "most_recent_strike_at": None,
+                "most_recent_strike_epoch": None,
                 "strike_count_recent": 0,
                 "window_minutes": LIGHTNING_WINDOW_MINUTES,
                 "filter_radius_mi": LIGHTNING_FILTER_RADIUS_MI,
@@ -249,6 +315,10 @@ def get_lightning_status():
             "level": level,
             "closest_distance_mi": round(closest, 1),
             "most_recent_strike_at": most_recent.isoformat(),
+            # Epoch seconds, so the device can convert to LOCAL time the
+            # same way it does for its clock. The ISO string above is UTC,
+            # which the device previously displayed as if it were local.
+            "most_recent_strike_epoch": int(most_recent.timestamp()),
             "strike_count_recent": count,
             "window_minutes": LIGHTNING_WINDOW_MINUTES,
             "filter_radius_mi": LIGHTNING_FILTER_RADIUS_MI,
