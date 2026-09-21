@@ -18,6 +18,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <math.h>
 #include <time.h>
 #include "wifi_credentials.h"
 
@@ -57,6 +58,11 @@ bool lightningActive = false;
 String lightningLevel = "none";
 float lightningClosestDistanceMi = 0;
 long lightningMostRecentEpoch = 0;  // seconds; 0 = none/unknown
+// The server's own lightning scope, shown in the Lightning page label so
+// the label can never disagree with what the server is actually filtering
+// on (the radius can be widened for testing via a Portainer variable).
+float lightningFilterRadiusMi = 10;
+int lightningWindowMinutes = 10;
 int lightningStrikeCountRecent = 0;
 
 bool nwsAvailable = false;
@@ -208,7 +214,27 @@ void initColors() {
   COLOR_STATUS_BAD        = M5.Display.color565(0xcc, 0x33, 0x33);
 }
 
-// ---- Now screen (unchanged from the approved design) ----
+// ---- Now screen ----
+
+// Small Wi-Fi fan (dot + three arcs), status-bar style. It means exactly
+// ONE thing: the device is associated with the router. It says nothing
+// about the server, Tempest, or NWS -- those have their own indicators
+// (the data-age text turns red when the backend goes quiet; the NWS
+// footer shows unknown). Dim green when connected, gray when not.
+// Drawn from plain rectangles so it doesn't depend on any arc API.
+void drawWifiGlyph(int cx, int cy, bool connected) {
+  uint16_t color = connected ? COLOR_NWS_CLEAR_TEXT : COLOR_TEXT_DIM;
+  M5.Display.fillCircle(cx, cy, 2, color);
+  const int radii[3] = {6, 10, 14};
+  for (int i = 0; i < 3; i++) {
+    for (int a = -40; a <= 40; a += 4) {
+      float rad = a * 0.0174533f;
+      int px = cx + (int)lroundf(radii[i] * sinf(rad));
+      int py = cy - (int)lroundf(radii[i] * cosf(rad));
+      M5.Display.fillRect(px - 1, py - 1, 2, 2, color);
+    }
+  }
+}
 
 void drawCommonHeader(const char *timeStr, const char *ageStr) {
   M5.Display.fillScreen(COLOR_BG);
@@ -222,6 +248,8 @@ void drawCommonHeader(const char *timeStr, const char *ageStr) {
   M5.Display.setTextColor(COLOR_TEXT_PRIMARY, COLOR_BG);
   M5.Display.setTextSize(2);
   M5.Display.drawString(timeStr, 16, 20);
+  // Top-right, on the clock row, below the data-age text.
+  drawWifiGlyph(294, 36, WiFi.status() == WL_CONNECTED);
 }
 
 void drawConditions(const char *tempStr, const char *feelsStr, const char *humidStr,
@@ -240,6 +268,24 @@ void drawConditions(const char *tempStr, const char *feelsStr, const char *humid
   M5.Display.drawString(windStr, 16, 106);
   M5.Display.drawString(gustStr, 168, 106);
   M5.Display.drawString(rainStr, 16, 128);
+}
+
+// Measured on the real display: text size 2 is 12px per character, size
+// 1 is 6px. (Earlier layout code assumed narrower text and clipped.)
+const int GLYPH_W_SIZE2 = 12;
+
+// "Thunderstorm" is the common offender ("Severe Thunderstorm Warning"
+// is 27 characters). NWS itself abbreviates it "T-storm".
+String shortenEventName(const String &name) {
+  String s = name;
+  s.replace("Thunderstorm", "T-storm");
+  return s;
+}
+
+// Size 2 if the text fits in maxWidth pixels, else size 1. A long alert
+// name shrinks; it never runs off the screen.
+int eventTextSize(const String &text, int maxWidth) {
+  return ((int)text.length() * GLYPH_W_SIZE2 <= maxWidth) ? 2 : 1;
 }
 
 void drawNwsFooterClear() {
@@ -264,8 +310,10 @@ void drawNwsWarningFooter(const String &eventText, const String &untilText) {
   M5.Display.fillRect(0, 196, 320, 44, COLOR_WARNING_BG);
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextColor(COLOR_WARNING_TEXT_HEADLINE, COLOR_WARNING_BG);
-  M5.Display.setTextSize(2);
-  M5.Display.drawString(eventText, 16, 202);
+  String eventName = shortenEventName(eventText);
+  int eventSize = eventTextSize(eventName, 300);   // x = 16 .. 316
+  M5.Display.setTextSize(eventSize);
+  M5.Display.drawString(eventName, 16, eventSize == 2 ? 202 : 206);
   M5.Display.setTextSize(1);
   M5.Display.setTextColor(COLOR_WARNING_TEXT_DETAIL, COLOR_WARNING_BG);
   M5.Display.drawString(untilText, 16, 224);
@@ -342,8 +390,10 @@ void drawNowPage() {
   }
 
   if (currentLightningView() == LIGHTNING_ACTIVE) {
+    // "Frequent lightning nearby" is 25 characters = 300px at size 2 and
+    // overflowed this banner; "nearby" is implied by the 10-mile scope.
     String bannerText = (lightningLevel == "frequent")
-                             ? "Frequent lightning nearby"
+                             ? "Frequent lightning"
                              : "Lightning nearby";
     drawLightningBanner(bannerText);
   }
@@ -596,7 +646,10 @@ void drawLightningPage() {
   // Activity count in filtered window
   M5.Display.setTextColor(COLOR_LABEL, COLOR_BG);
   M5.Display.setTextSize(1);
-  M5.Display.drawString("ACTIVITY (LAST 10 MIN, WITHIN 10 MI)", 16, 172);
+  char activityLabel[48];
+  snprintf(activityLabel, sizeof(activityLabel), "ACTIVITY (LAST %d MIN, WITHIN %g MI)",
+           lightningWindowMinutes, lightningFilterRadiusMi);
+  M5.Display.drawString(activityLabel, 16, 172);
 
   char countStr[16];
   snprintf(countStr, sizeof(countStr), "%d strikes", lightningStrikeCountRecent);
@@ -607,32 +660,56 @@ void drawLightningPage() {
                         16, 188);
 }
 
-// NWS instruction text: word-wrap + truncation.
+// NWS instruction text: whitespace cleanup, word-wrap, two layouts.
 //
-// MAX_CHARS_PER_LINE is a HARDWARE-VERIFIED safe budget at text size 2
-// in the 288px-wide instruction column -- not derived from a font-metrics
-// API (LovyanGFX/M5GFX's own pixel-width measurement capability wasn't
-// confirmed available, so this isn't built on that). Instead it's based
-// on real evidence: the original 6 demo lines Dan already confirmed fit
-// cleanly on real hardware had a longest line of 44 characters. 42 is
-// used here as a small safety margin under that confirmed-working value.
-const int NWS_MAX_CHARS_PER_LINE = 42;
-const int NWS_MAX_INSTRUCTION_LINES = 6;
+// Measured on the real display: text size 2 is 12px per character, so the
+// 288px instruction column holds 24 characters per line; size 1 holds 48.
+// (The first version assumed 42 characters per line at size 2 -- 504px on
+// a 320px screen -- and would have clipped real alerts.)
+//
+// Each alert picks its own layout: size 2 (large, 6 lines) if the whole
+// text fits without truncation, otherwise size 1 (small, 10 lines) so a
+// long official instruction is shown in full rather than cut off. Only
+// text too long even for size 1 gets the " ..." truncation marker.
+const int NWS_LINE_CHARS_LARGE = 24;
+const int NWS_LINE_CHARS_SMALL = 48;
+const int NWS_LINES_LARGE = 6;
+const int NWS_LINES_SMALL = 10;
+
+// NWS text arrives with embedded newlines and runs of spaces (it is
+// hard-wrapped at ~69 columns upstream). Flatten to single spaces so our
+// own wrapping decides the line breaks.
+String collapseWhitespace(const String &in) {
+  String out;
+  bool lastWasSpace = true;   // also drops leading whitespace
+  for (int i = 0; i < (int)in.length(); i++) {
+    char c = in.charAt(i);
+    if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+    if (c == ' ') {
+      if (lastWasSpace) continue;
+      lastWasSpace = true;
+    } else {
+      lastWasSpace = false;
+    }
+    out += c;
+  }
+  out.trim();
+  return out;
+}
 
 // Word-wraps `text` into `outLines` (capacity `maxLines`), breaking on
-// word boundaries where possible. If the text is longer than maxLines
-// can hold, the last line is trimmed and " ..." appended as a
-// truncation indicator, per the agreed approach (truncate rather than
-// scroll/paginate, to avoid colliding with tap-to-advance navigation).
-// Returns the number of lines actually used.
-int wrapInstructionText(const String &text, String outLines[], int maxLines) {
+// word boundaries where possible (a single word longer than a line is
+// hard-broken). Sets `truncated` and ends the last line with " ..." if
+// the text didn't all fit. Returns the number of lines used.
+int wrapInstructionText(const String &text, String outLines[], int maxLines,
+                        int charsPerLine, bool &truncated) {
   int lineCount = 0;
   int pos = 0;
   int len = text.length();
 
   while (pos < len && lineCount < maxLines) {
     int remaining = len - pos;
-    int take = min(remaining, NWS_MAX_CHARS_PER_LINE);
+    int take = min(remaining, charsPerLine);
 
     if (pos + take < len) {
       String chunk = text.substring(pos, pos + take);
@@ -650,9 +727,10 @@ int wrapInstructionText(const String &text, String outLines[], int maxLines) {
     while (pos < len && text.charAt(pos) == ' ') pos++;
   }
 
-  if (pos < len && lineCount > 0) {
+  truncated = (pos < len);
+  if (truncated && lineCount > 0) {
     String &lastLine = outLines[lineCount - 1];
-    int maxLastLineLen = NWS_MAX_CHARS_PER_LINE - 4;
+    int maxLastLineLen = charsPerLine - 4;
     if ((int)lastLine.length() > maxLastLineLen) {
       lastLine = lastLine.substring(0, maxLastLineLen);
     }
@@ -660,6 +738,25 @@ int wrapInstructionText(const String &text, String outLines[], int maxLines) {
   }
 
   return lineCount;
+}
+
+// Picks the layout for one alert's instruction text and fills `lines`
+// (capacity NWS_LINES_SMALL). Returns the line count (0 = no text).
+int layoutInstruction(const String &raw, String lines[], int &textSize,
+                      int &lineHeight, bool &truncated) {
+  String text = collapseWhitespace(raw);
+  textSize = 2;
+  lineHeight = 16;
+  truncated = false;
+  if (text.length() == 0) return 0;
+
+  int n = wrapInstructionText(text, lines, NWS_LINES_LARGE, NWS_LINE_CHARS_LARGE, truncated);
+  if (truncated) {
+    textSize = 1;
+    lineHeight = 10;
+    n = wrapInstructionText(text, lines, NWS_LINES_SMALL, NWS_LINE_CHARS_SMALL, truncated);
+  }
+  return n;
 }
 
 void drawNwsAlertsPage() {
@@ -701,8 +798,10 @@ void drawNwsAlertsPage() {
   // real first active alert's event name and expiration.
   M5.Display.fillRect(16, 48, 288, 34, COLOR_WARNING_BG);
   M5.Display.setTextColor(COLOR_WARNING_TEXT_HEADLINE, COLOR_WARNING_BG);
-  M5.Display.setTextSize(2);
-  M5.Display.drawString(nwsFirstAlertEvent, 24, 54);
+  String eventName = shortenEventName(nwsFirstAlertEvent);
+  int eventSize = eventTextSize(eventName, 272);   // x = 24 .. 296, inside the 16..304 box
+  M5.Display.setTextSize(eventSize);
+  M5.Display.drawString(eventName, 24, eventSize == 2 ? 54 : 58);
   M5.Display.setTextSize(1);
   M5.Display.setTextColor(COLOR_WARNING_TEXT_DETAIL, COLOR_WARNING_BG);
   // Crude time extraction, same placeholder as elsewhere -- real
@@ -718,16 +817,26 @@ void drawNwsAlertsPage() {
   M5.Display.setTextSize(1);
   M5.Display.drawString("INSTRUCTION", 16, 92);
 
-  String wrappedLines[NWS_MAX_INSTRUCTION_LINES];
-  int lineCount = wrapInstructionText(nwsFirstAlertInstruction, wrappedLines,
-                                       NWS_MAX_INSTRUCTION_LINES);
+  String wrappedLines[NWS_LINES_SMALL];
+  int instrSize, instrLineH;
+  bool instrTruncated;
+  int lineCount = layoutInstruction(nwsFirstAlertInstruction, wrappedLines,
+                                    instrSize, instrLineH, instrTruncated);
+
+  int y = 106;
+  if (lineCount == 0) {
+    // Some NWS products carry no instruction text at all.
+    M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+    M5.Display.setTextSize(1);
+    M5.Display.drawString("(no instruction text provided)", 16, y);
+    return;
+  }
 
   M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
-  M5.Display.setTextSize(2);
-  int y = 106;
+  M5.Display.setTextSize(instrSize);
   for (int i = 0; i < lineCount; i++) {
     M5.Display.drawString(wrappedLines[i], 16, y);
-    y += 16;
+    y += instrLineH;
   }
 }
 
@@ -743,7 +852,9 @@ void drawStatusPage() {
   String wifiValue;
   uint16_t wifiDotColor;
   if (wifiConnected) {
-    wifiValue = "Connected (" + String(WiFi.RSSI()) + " dBm)";
+    // Kept short: the longer "Connected (-70 dBm)" (228px) overwrote
+    // the "Wi-Fi" label on the real display.
+    wifiValue = "OK (" + String(WiFi.RSSI()) + " dBm)";
     wifiDotColor = COLOR_NWS_CLEAR_DOT;
   } else {
     wifiValue = "Disconnected";
@@ -1061,6 +1172,8 @@ void fetchConditions() {
 
   lightningActive = doc["lightning"]["active"];
   lightningLevel = doc["lightning"]["level"].as<String>();
+  lightningFilterRadiusMi = doc["lightning"]["filter_radius_mi"] | 10.0f;
+  lightningWindowMinutes = doc["lightning"]["window_minutes"] | 10;
   if (lightningActive) {
     lightningClosestDistanceMi = doc["lightning"]["closest_distance_mi"];
     lightningMostRecentEpoch = doc["lightning"]["most_recent_strike_epoch"] | 0L;
@@ -1071,10 +1184,13 @@ void fetchConditions() {
   JsonArray alerts = doc["nws"]["alerts"];
   nwsAlertCount = alerts.size();
   if (nwsAlertCount > 0) {
-    nwsFirstAlertEvent = alerts[0]["event"].as<String>();
-    nwsFirstAlertExpires = alerts[0]["expires"].as<String>();
-    nwsFirstAlertInstruction = alerts[0]["instruction"].as<String>();
-    nwsFirstAlertId = alerts[0]["id"].as<String>();
+    // "| """ (not .as<String>()) so a JSON null -- NWS often sends
+    // "instruction": null -- becomes an empty string instead of risking
+    // the literal text "null" appearing on screen.
+    nwsFirstAlertEvent = alerts[0]["event"] | "";
+    nwsFirstAlertExpires = alerts[0]["expires"] | "";
+    nwsFirstAlertInstruction = alerts[0]["instruction"] | "";
+    nwsFirstAlertId = alerts[0]["id"] | "";
     nwsFirstAlertAcknowledged = alerts[0]["acknowledged"];
     nwsFirstAlertNeedsAlert = alerts[0]["needs_alert"];
   } else {

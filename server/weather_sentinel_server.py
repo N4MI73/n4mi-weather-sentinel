@@ -185,7 +185,26 @@ seen_message_types = set()
 # --- Lightning: 10-mile filter + heavy/sporadic classification ---
 # Confirmed requirement: only strikes within this radius matter to this
 # device at all -- farther strikes are outside scope, not tracked.
-LIGHTNING_FILTER_RADIUS_MI = 10.0
+def _radius_from_env(default=10.0):
+    """LIGHTNING_FILTER_RADIUS_MI from the environment (Portainer), so the
+    radius can be widened for testing and put back without a code change.
+    A missing, non-numeric, or non-positive value falls back to the
+    confirmed 10-mile requirement, loudly, rather than silently."""
+    raw = os.environ.get("LIGHTNING_FILTER_RADIUS_MI")
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = float(raw)
+        if value <= 0:
+            raise ValueError("must be positive")
+        return value
+    except ValueError as e:
+        print(f"[config] IGNORING bad LIGHTNING_FILTER_RADIUS_MI={raw!r} ({e}); "
+              f"using {default:g} mi", flush=True)
+        return default
+
+
+LIGHTNING_FILTER_RADIUS_MI = _radius_from_env()
 
 # PLACEHOLDERS -- these need Dan's own bench-testing calibration once
 # real hardware/real storms exist to test against, per the project's
@@ -635,6 +654,8 @@ def healthz():
 
 if __name__ == "__main__":
     load_persisted_alerts()
+    print(f"[config] lightning filter radius = {LIGHTNING_FILTER_RADIUS_MI:g} mi "
+          f"(default is 10; set LIGHTNING_FILTER_RADIUS_MI to change)", flush=True)
 
     listener = threading.Thread(target=udp_listener_thread, daemon=True)
     listener.start()
