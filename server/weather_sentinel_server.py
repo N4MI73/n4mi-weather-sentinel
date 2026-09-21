@@ -118,6 +118,19 @@ latest_conditions = {
     "rain_this_interval_in": None,
 }
 
+# When the last obs_st packet was RECEIVED, on this server's own monotonic
+# clock (immune to clock skew between the hub and this host, and to
+# wall-clock changes). "available" above only ever meant "at least one
+# packet has ever arrived"; api_conditions() combines it with this to
+# report whether observations are actually still flowing.
+last_obs_received_monotonic = None
+TEMPEST_STALE_SEC = 300  # obs_st normally arrives about once a minute;
+                          # PLACEHOLDER -- 5 minutes tolerates a few drops.
+
+# Message types seen since startup, so the log records the first packet
+# of each kind (e.g. whether evt_strike has EVER arrived on this port).
+seen_message_types = set()
+
 # --- Lightning: 10-mile filter + heavy/sporadic classification ---
 # Confirmed requirement: only strikes within this radius matter to this
 # device at all -- farther strikes are outside scope, not tracked.
@@ -150,8 +163,20 @@ latest_nws = {
 
 
 def handle_obs_st(msg):
+    global last_obs_received_monotonic
     obs = msg["obs"][0]
+
+    # Diagnostic: obs_st also carries the sensor's own per-interval
+    # lightning summary (index 14 = average distance in km, 15 = strike
+    # count). Log it whenever nonzero -- if it shows strikes while no
+    # evt_strike packets are arriving, per-strike events are not being
+    # delivered to this listener. Log-only; does not affect any state.
+    if len(obs) > 15 and obs[15]:
+        print(f"[udp] obs_st reports {obs[15]} strike(s) this interval, "
+              f"avg distance {obs[14]} km ({float(obs[14]) * KM_TO_MI:.1f} mi)", flush=True)
+
     with state_lock:
+        last_obs_received_monotonic = time.monotonic()
         latest_conditions["available"] = True
         latest_conditions["observed_at"] = iso_time(obs[0])
         latest_conditions["wind_mph"] = round(obs[2] * MS_TO_MPH, 1)
@@ -173,16 +198,27 @@ def _prune_recent_strikes_locked():
 def handle_evt_strike(msg):
     epoch, distance_km, energy = msg["evt"]
     distance_mi = distance_km * KM_TO_MI
+    age_sec = time.time() - epoch
 
     if distance_mi > LIGHTNING_FILTER_RADIUS_MI:
         # Outside the confirmed 10-mile scope -- not relevant to this
         # device, deliberately not tracked at all.
+        print(f"[strike] {distance_km} km ({distance_mi:.1f} mi), stamped {age_sec:.0f}s ago "
+              f"-> IGNORED (beyond {LIGHTNING_FILTER_RADIUS_MI:g} mi)", flush=True)
         return
 
     strike_time = datetime.fromtimestamp(epoch, tz=timezone.utc)
     with state_lock:
         recent_strikes.append({"distance_mi": distance_mi, "at": strike_time})
         _prune_recent_strikes_locked()
+        kept = len(recent_strikes)
+    # If the strike's own timestamp is already older than the window,
+    # pruning drops it immediately -- say so, since that looks identical
+    # to "never arrived" from the API side.
+    outcome = "TRACKED" if kept else (
+        f"DROPPED -- stamp is older than the {LIGHTNING_WINDOW_MINUTES}-minute window")
+    print(f"[strike] {distance_km} km ({distance_mi:.1f} mi), stamped {age_sec:.0f}s ago "
+          f"-> {outcome} (in-window strikes now: {kept})", flush=True)
 
 
 def get_lightning_status():
@@ -430,19 +466,30 @@ def udp_listener_thread():
     print(f"[udp] Listening on port {UDP_PORT}")
 
     while True:
-        data, addr = sock.recvfrom(4096)
         try:
-            msg = json.loads(data.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            data, addr = sock.recvfrom(4096)
+        except OSError as e:
+            print(f"[udp] recvfrom error: {e!r} -- retrying", flush=True)
+            time.sleep(1)
             continue
 
-        msg_type = msg.get("type")
-        if msg_type == "obs_st":
-            handle_obs_st(msg)
-            print(f"[udp] obs_st received, temp={latest_conditions['temperature_f']}F")
-        elif msg_type == "evt_strike":
-            handle_evt_strike(msg)
-            print(f"[udp] evt_strike received (logged after distance filter/pruning)")
+        # A malformed or unexpected packet must never kill this thread:
+        # the HTTP side would keep serving frozen data with nothing
+        # visibly wrong. Log it (with the raw packet) and carry on.
+        try:
+            msg = json.loads(data.decode("utf-8"))
+            msg_type = msg.get("type")
+            if msg_type not in seen_message_types:
+                seen_message_types.add(msg_type)
+                print(f"[udp] first packet of type {msg_type!r} since startup", flush=True)
+
+            if msg_type == "obs_st":
+                handle_obs_st(msg)
+                print(f"[udp] obs_st received, temp={latest_conditions['temperature_f']}F")
+            elif msg_type == "evt_strike":
+                handle_evt_strike(msg)
+        except Exception as e:  # noqa: BLE001 -- deliberately broad, see above
+            print(f"[udp] ERROR handling packet: {e!r} -- raw: {data[:300]!r}", flush=True)
 
 
 app = Flask(__name__)
@@ -452,6 +499,8 @@ app = Flask(__name__)
 def api_conditions():
     with state_lock:
         tempest_copy = dict(latest_conditions)
+        obs_age = (None if last_obs_received_monotonic is None
+                   else time.monotonic() - last_obs_received_monotonic)
         nws_available = latest_nws["available"]
         nws_last_polled = latest_nws["last_polled_at"]
         alerts_copy = [
@@ -471,6 +520,16 @@ def api_conditions():
     # (not reentrant), so calling it while still holding the lock above
     # would deadlock the very first time this endpoint is hit.
     lightning_status = get_lightning_status()
+
+    # "available" is only true while observations are actually still
+    # arriving -- not merely because one packet arrived once, some time
+    # ago. Strike events share the same UDP source, so this also stands
+    # in for "the lightning feed is alive". The last good values are
+    # left in place (same stale-data convention as NWS below); the
+    # device decides how to present them.
+    if obs_age is None or obs_age > TEMPEST_STALE_SEC:
+        tempest_copy["available"] = False
+    tempest_copy["observation_age_sec"] = None if obs_age is None else round(obs_age)
 
     return jsonify({
         "tempest": tempest_copy,

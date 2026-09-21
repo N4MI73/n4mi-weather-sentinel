@@ -78,6 +78,62 @@ const unsigned long FETCH_INTERVAL_MS = 60000;  // 60s -- matches obs_st's
                                                   // surface newer data
 unsigned long lastFetchAttemptMillis = 0;
 
+// ---- Data freshness (stale-data guardrail) ----
+// When a fetch fails, the globals above keep their LAST GOOD values --
+// which is right for showing an old temperature, but wrong for "no
+// alerts" or "no lightning": those must only ever be shown from a
+// current check. Everything that decides between clear / alert /
+// unknown goes through the helpers below instead of reading the raw
+// globals directly, so the Now page, the detail pages, and the
+// persistent strip can never disagree with each other.
+//
+// Both values are PLACEHOLDERS to tune on real hardware.
+// DATA_STALE_MS: fetches run every 60s, so 100s tolerates one missed
+// fetch and flags after two in a row.
+// LIGHTNING_HOLD_MS: how long a retained "lightning active" reading
+// stays visible while the backend is unreachable (mirrors the server's
+// 10-minute strike window); after that it becomes "unknown".
+const unsigned long DATA_STALE_MS = 100000;
+const unsigned long LIGHTNING_HOLD_MS = 600000;
+
+unsigned long dataAgeMs() {
+  if (!hasEverFetchedSuccessfully) return (unsigned long)-1;  // max value
+  return millis() - lastSuccessfulFetchMillis;
+}
+
+bool backendDataFresh() {
+  return hasEverFetchedSuccessfully && dataAgeMs() < DATA_STALE_MS;
+}
+
+enum NwsView { NWS_VIEW_UNKNOWN, NWS_VIEW_CLEAR, NWS_VIEW_ALERT, NWS_VIEW_ALERT_STALE };
+
+// An active alert is ALWAYS shown, even when the NWS check isn't
+// current (marked stale) -- hiding a possible warning is worse than
+// showing one that may have just expired. "Clear" requires a fresh
+// backend AND the server reporting its own NWS poll as successful.
+NwsView currentNwsView() {
+  bool checkCurrent = backendDataFresh() && nwsAvailable;
+  if (nwsAlertCount > 0) return checkCurrent ? NWS_VIEW_ALERT : NWS_VIEW_ALERT_STALE;
+  return checkCurrent ? NWS_VIEW_CLEAR : NWS_VIEW_UNKNOWN;
+}
+
+enum LightningView { LIGHTNING_UNKNOWN, LIGHTNING_CLEAR, LIGHTNING_ACTIVE };
+
+// "Clear" requires fresh data AND Tempest reporting available, since
+// the strike listener shares the same UDP source as the observations.
+// NOTE: this is only as good as the server's own definition of
+// tempest.available -- if that flag never goes false once data has
+// been received, a silent hub still won't be caught here. To be
+// checked against server code.
+LightningView currentLightningView() {
+  bool current = backendDataFresh() && tempestAvailable;
+  if (current) return lightningActive ? LIGHTNING_ACTIVE : LIGHTNING_CLEAR;
+  if (hasEverFetchedSuccessfully && lightningActive && dataAgeMs() < LIGHTNING_HOLD_MS) {
+    return LIGHTNING_ACTIVE;
+  }
+  return LIGHTNING_UNKNOWN;
+}
+
 String formatAgeString() {
   if (!hasEverFetchedSuccessfully) {
     return "no data yet";
@@ -153,7 +209,9 @@ void initColors() {
 void drawCommonHeader(const char *timeStr, const char *ageStr) {
   M5.Display.fillScreen(COLOR_BG);
   M5.Display.setTextDatum(top_right);
-  M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+  // Age text turns red once data is stale, so old numbers can't pass
+  // for current ones at a glance.
+  M5.Display.setTextColor(backendDataFresh() ? COLOR_TEXT_DIM : COLOR_STATUS_BAD, COLOR_BG);
   M5.Display.setTextSize(1);
   M5.Display.drawString(ageStr, 308, 8);
   M5.Display.setTextDatum(top_left);
@@ -252,21 +310,23 @@ void drawNowPage() {
     drawConditions(tempStr, "", humidStr, windStr, gustStr, rainStr);
   }
 
-  if (lightningActive) {
+  if (currentLightningView() == LIGHTNING_ACTIVE) {
     String bannerText = (lightningLevel == "frequent")
                              ? "Frequent lightning nearby"
                              : "Lightning nearby";
     drawLightningBanner(bannerText);
   }
 
-  if (!nwsAvailable) {
+  NwsView nwsView = currentNwsView();
+  if (nwsView == NWS_VIEW_UNKNOWN) {
     drawNwsFooterUnknown();
-  } else if (nwsAlertCount > 0) {
-    String untilText = "Until " + extractTimeFromIso(nwsFirstAlertExpires) +
-                        " -- tap for details";
-    drawNwsWarningFooter(nwsFirstAlertEvent, untilText);
-  } else {
+  } else if (nwsView == NWS_VIEW_CLEAR) {
     drawNwsFooterClear();
+  } else {
+    String untilText = "Until " + extractTimeFromIso(nwsFirstAlertExpires) +
+                        (nwsView == NWS_VIEW_ALERT_STALE ? " -- status not current"
+                                                          : " -- tap for details");
+    drawNwsWarningFooter(nwsFirstAlertEvent, untilText);
   }
 }
 
@@ -292,15 +352,17 @@ void drawPersistentStrip() {
   // elsewhere in this project. NWS-unreachable gets its own neutral
   // state too, for the same reason the Now screen and NWS Alerts page
   // both distinguish it from a genuine "clear".
-  if (nwsAlertCount > 0) {
+  NwsView nwsView = currentNwsView();
+  if (nwsView == NWS_VIEW_ALERT || nwsView == NWS_VIEW_ALERT_STALE) {
     bg = COLOR_WARNING_BG;
     textColor = COLOR_WARNING_TEXT_HEADLINE;
     msg = nwsFirstAlertEvent;
-  } else if (lightningActive) {
+    if (nwsView == NWS_VIEW_ALERT_STALE) msg += " (status not current)";
+  } else if (currentLightningView() == LIGHTNING_ACTIVE) {
     bg = COLOR_LIGHTNING_BG;
     textColor = COLOR_LIGHTNING_TEXT;
     msg = (lightningLevel == "frequent") ? "Frequent lightning nearby" : "Lightning nearby";
-  } else if (!nwsAvailable) {
+  } else if (nwsView == NWS_VIEW_UNKNOWN) {
     bg = COLOR_BG;
     textColor = COLOR_TEXT_DIM;
     msg = "NWS status unknown";
@@ -431,12 +493,17 @@ void drawWindRainPage() {
 void drawLightningPage() {
   drawSecondaryHeader("Lightning", PAGE_LIGHTNING);
 
+  // All decisions below use the freshness-aware view, never the raw
+  // lightningActive global (see currentLightningView()).
+  LightningView lv = currentLightningView();
+  bool lActive = (lv == LIGHTNING_ACTIVE);
+
   // Badge: amber "active" treatment when lightning.active is true (same
   // fixed-height, two-line-capable box already confirmed working on
   // hardware); a new, NOT previously mocked/approved neutral "clear"
   // treatment otherwise, since the approved mockup only ever showed the
   // active state -- worth a look once this is on real hardware.
-  if (lightningActive) {
+  if (lActive) {
     M5.Display.fillRoundRect(16, 48, 288, 50, 6, COLOR_LIGHTNING_BG);
     M5.Display.drawRoundRect(16, 48, 288, 50, 6, COLOR_LIGHTNING_BORDER);
     M5.Display.setTextDatum(top_left);
@@ -448,6 +515,16 @@ void drawLightningPage() {
     } else {
       M5.Display.drawString("Lightning nearby", 26, 66);
     }
+  } else if (lv == LIGHTNING_UNKNOWN) {
+    // Neutral gray -- data isn't current, so this must NOT read as an
+    // all-clear.
+    M5.Display.fillRoundRect(16, 48, 288, 50, 6, COLOR_BG);
+    M5.Display.drawRoundRect(16, 48, 288, 50, 6, COLOR_SEPARATOR);
+    M5.Display.setTextDatum(top_left);
+    M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+    M5.Display.setTextSize(2);
+    M5.Display.drawString("Lightning status", 26, 56);
+    M5.Display.drawString("unknown", 26, 76);
   } else {
     M5.Display.fillRoundRect(16, 48, 288, 50, 6, COLOR_BG);
     M5.Display.drawRoundRect(16, 48, 288, 50, 6, COLOR_SEPARATOR);
@@ -462,9 +539,9 @@ void drawLightningPage() {
   M5.Display.setTextSize(1);
   M5.Display.drawString("CLOSEST RECENT STRIKE", 16, 108);
 
-  M5.Display.setTextColor(lightningActive ? COLOR_TEXT_PRIMARY : COLOR_TEXT_DIM, COLOR_BG);
+  M5.Display.setTextColor(lActive ? COLOR_TEXT_PRIMARY : COLOR_TEXT_DIM, COLOR_BG);
   M5.Display.setTextSize(3);
-  if (lightningActive) {
+  if (lActive) {
     char distStr[12];
     snprintf(distStr, sizeof(distStr), "%.1f mi", lightningClosestDistanceMi);
     M5.Display.drawString(distStr, 16, 124);
@@ -474,7 +551,7 @@ void drawLightningPage() {
     // "until" time -- real relative-age formatting needs NTP.
     M5.Display.drawString(extractTimeFromIso(lightningMostRecentAt), 130, 130);
   } else {
-    M5.Display.drawString("None", 16, 124);
+    M5.Display.drawString(lv == LIGHTNING_UNKNOWN ? "--" : "None", 16, 124);
   }
 
   M5.Display.drawFastHLine(16, 162, 288, COLOR_SEPARATOR);
@@ -486,9 +563,11 @@ void drawLightningPage() {
 
   char countStr[16];
   snprintf(countStr, sizeof(countStr), "%d strikes", lightningStrikeCountRecent);
-  M5.Display.setTextColor(lightningActive ? COLOR_TEXT_PRIMARY : COLOR_TEXT_DIM, COLOR_BG);
+  M5.Display.setTextColor(lActive ? COLOR_TEXT_PRIMARY : COLOR_TEXT_DIM, COLOR_BG);
   M5.Display.setTextSize(2);
-  M5.Display.drawString(lightningActive ? countStr : "0 strikes", 16, 188);
+  M5.Display.drawString(lActive ? countStr
+                                : (lv == LIGHTNING_UNKNOWN ? "--" : "0 strikes"),
+                        16, 188);
 }
 
 // NWS instruction text: word-wrap + truncation.
@@ -551,16 +630,24 @@ void drawNwsAlertsPage() {
 
   M5.Display.setTextDatum(top_left);
 
-  if (!nwsAvailable) {
+  NwsView nwsView = currentNwsView();
+
+  if (nwsView == NWS_VIEW_UNKNOWN) {
     // Same "status unknown" language as the Now screen's footer -- never
     // let an unreachable NWS check look like a real, checked "clear".
     M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
     M5.Display.setTextSize(2);
     M5.Display.drawString("NWS status unknown", 16, 60);
+    // One-line reason, so "the server is down" and "the server can't
+    // reach NWS" aren't indistinguishable.
+    M5.Display.setTextSize(1);
+    M5.Display.drawString(backendDataFresh() ? "Server can't reach NWS"
+                                             : "Server not responding",
+                           16, 86);
     return;
   }
 
-  if (nwsAlertCount == 0) {
+  if (nwsView == NWS_VIEW_CLEAR) {
     // No approved mockup for this state (the v2 layout only ever showed
     // an active alert) -- simple, calm treatment, consistent with the
     // Now screen's own "NO ACTIVE ALERTS" language and color.
@@ -584,6 +671,7 @@ void drawNwsAlertsPage() {
   // Crude time extraction, same placeholder as elsewhere -- real
   // relative/12-hour formatting needs NTP (a separate step).
   String untilText = "Until " + extractTimeFromIso(nwsFirstAlertExpires);
+  if (nwsView == NWS_VIEW_ALERT_STALE) untilText += "  -- status not current";
   M5.Display.drawString(untilText, 24, 72);
 
   // Instruction: full official text, word-wrapped and truncated with an
@@ -683,7 +771,7 @@ void drawSettingsPage() {
   M5.Display.drawString("(tap to return)", 16, 140);
 }
 
-void renderPage(Page p) {
+void renderPageInner(Page p) {
   switch (p) {
     case PAGE_NOW:
       drawNowPage();
@@ -710,6 +798,21 @@ void renderPage(Page p) {
       return;  // Settings doesn't carry the alert strip either
   }
   drawPersistentStrip();
+}
+
+// Timing wrapper: logs any page draw slower than DIAG_SLOW_RENDER_MS, so
+// a slow redraw can be told apart from a blocked network call when
+// reading the serial log.
+const unsigned long DIAG_SLOW_RENDER_MS = 100;
+const unsigned long DIAG_LOOP_GAP_MS = 250;
+
+void renderPage(Page p) {
+  unsigned long t0 = millis();
+  renderPageInner(p);
+  unsigned long dt = millis() - t0;
+  if (dt > DIAG_SLOW_RENDER_MS) {
+    Serial.printf("[diag] slow render: page %d took %lu ms\n", (int)p, dt);
+  }
 }
 
 // Phase 2a: Wi-Fi connectivity only -- no HTTP fetch, no screen changes
@@ -827,15 +930,26 @@ String formatCurrentTime() {
 // me (same sandbox limitation as always for firmware) -- treat this the
 // same as everything else that needs a real build to confirm.
 //
-// KNOWN LIMITATION, not yet addressed: http.GET() blocks the main loop
-// for its duration. On a healthy local-LAN request this is well under a
-// second and unnoticeable, but if the server becomes unreachable, this
-// could cause a brief (multi-second) pause in touch responsiveness once
-// every 60s until the request times out. Proper non-blocking HTTP is
-// real added complexity, deliberately deferred to the failure-state-
-// handling pass rather than solved here.
-const char *SERVER_URL = "http://192.168.6.29:8085/api/conditions";
-const char *ACK_URL = "http://192.168.6.29:8085/api/alerts/ack";
+// KNOWN LIMITATION, partly mitigated: http.GET() still blocks the main
+// loop for its duration. On a healthy local-LAN request that is well
+// under a second, but an unreachable server used to freeze touch for up
+// to ~10s per attempt (Arduino-ESP32's defaults are 5s connect + 5s
+// read -- confirmed against the 2.0.17 and 3.1.0 HTTPClient source).
+// The explicit timeouts below cap that. Proper non-blocking HTTP (a
+// background fetch task) is NOT built yet -- decide after reading the
+// [fetch] / [diag] serial timing this version logs.
+//
+// The server address comes from wifi_credentials.h (gitignored), not
+// from committed source -- see wifi_credentials.h.example.
+#ifndef SERVER_BASE_URL
+#error "SERVER_BASE_URL is not defined -- add it to wifi_credentials.h (see wifi_credentials.h.example)"
+#endif
+const char *SERVER_URL = SERVER_BASE_URL "/api/conditions";
+const char *ACK_URL = SERVER_BASE_URL "/api/alerts/ack";
+
+// PLACEHOLDERS -- tune after reading real timing from the serial log.
+const int32_t HTTP_CONNECT_TIMEOUT_MS = 2000;
+const uint16_t HTTP_READ_TIMEOUT_MS = 3000;
 
 void fetchConditions() {
   if (WiFi.status() != WL_CONNECTED) {
@@ -844,13 +958,18 @@ void fetchConditions() {
     return;
   }
 
-  Serial.println("[fetch] Requesting /api/conditions...");
+  Serial.printf("[fetch] Requesting /api/conditions... (t=%lu ms)\n", millis());
+  unsigned long fetchStart = millis();
   HTTPClient http;
+  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+  http.setTimeout(HTTP_READ_TIMEOUT_MS);
   http.begin(SERVER_URL);
   int httpCode = http.GET();
+  unsigned long getMs = millis() - fetchStart;
 
   if (httpCode != 200) {
-    Serial.printf("[fetch] HTTP request FAILED, code: %d\n", httpCode);
+    Serial.printf("[fetch] HTTP request FAILED, code: %d (%s), blocked %lu ms\n",
+                  httpCode, HTTPClient::errorToString(httpCode).c_str(), getMs);
     http.end();
     lastFetchSucceeded = false;
     return;
@@ -858,7 +977,8 @@ void fetchConditions() {
 
   String payload = http.getString();
   http.end();
-  Serial.printf("[fetch] Got response, %d bytes\n", payload.length());
+  Serial.printf("[fetch] Got response, %d bytes (GET+read %lu ms)\n",
+                payload.length(), millis() - fetchStart);
 
   JsonDocument doc;
   DeserializationError error = deserializeJson(doc, payload);
@@ -916,6 +1036,7 @@ void fetchConditions() {
                 tempestWindDir.c_str());
   Serial.printf("[fetch]   lightning.level=%s  nws.available=%s  alerts=%d\n",
                 lightningLevel.c_str(), nwsAvailable ? "true" : "false", nwsAlertCount);
+  Serial.printf("[fetch] OK -- total blocked %lu ms\n", millis() - fetchStart);
 }
 
 // Phase 2g: alert acknowledgement. Same blocking-HTTP characteristic as
@@ -928,8 +1049,11 @@ void ackAlert(const String &alertId) {
     return;
   }
 
-  Serial.printf("[ack] Acknowledging alert %s...\n", alertId.c_str());
+  Serial.printf("[ack] Acknowledging alert %s... (t=%lu ms)\n", alertId.c_str(), millis());
+  unsigned long ackStart = millis();
   HTTPClient http;
+  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+  http.setTimeout(HTTP_READ_TIMEOUT_MS);
   http.begin(ACK_URL);
   http.addHeader("Content-Type", "application/json");
 
@@ -939,6 +1063,7 @@ void ackAlert(const String &alertId) {
   serializeJson(doc, body);
 
   int httpCode = http.POST(body);
+  Serial.printf("[ack] POST returned %d after %lu ms\n", httpCode, millis() - ackStart);
   if (httpCode == 200) {
     Serial.println("[ack] Success.");
     // Optimistic local update -- the next periodic fetch (up to 60s
@@ -948,7 +1073,8 @@ void ackAlert(const String &alertId) {
     nwsFirstAlertAcknowledged = true;
     nwsFirstAlertNeedsAlert = false;
   } else {
-    Serial.printf("[ack] FAILED, code: %d -- prompt stays up, can retry\n", httpCode);
+    Serial.printf("[ack] FAILED, code: %d (%s) -- prompt stays up, can retry\n",
+                  httpCode, HTTPClient::errorToString(httpCode).c_str());
   }
   http.end();
 }
@@ -974,12 +1100,24 @@ void setup() {
 }
 
 void loop() {
+  // Diagnostic: any loop iteration that starts much later than the last
+  // one means something blocked (fetch, ack, a slow draw, serial).
+  static unsigned long lastLoopMillis = 0;
+  unsigned long loopNow = millis();
+  if (lastLoopMillis != 0 && loopNow - lastLoopMillis > DIAG_LOOP_GAP_MS) {
+    Serial.printf("[diag] loop gap %lu ms (t=%lu) -- UI was blocked\n",
+                  loopNow - lastLoopMillis, loopNow);
+  }
+  lastLoopMillis = loopNow;
+
   M5.update();
   auto touch = M5.Touch.getDetail();
 
   if (touch.wasPressed()) {
     touchStartTime = millis();
     longPressHandled = false;
+    Serial.printf("[touch] press x=%d y=%d t=%lu page=%d\n",
+                  (int)touch.x, (int)touch.y, millis(), (int)currentPage);
   }
 
   if (touch.isPressed() && !longPressHandled &&
@@ -998,6 +1136,15 @@ void loop() {
   // M5Unified's own touch_detail_t source before using it here.
   if (touch.wasClicked() && !longPressHandled) {
     lastActivityTime = millis();
+
+    // Diagnostic: time since the previous click. Several page advances
+    // from one physical tap would show up here as clicks only a few ms
+    // apart.
+    static unsigned long lastClickMillis = 0;
+    Serial.printf("[touch] click x=%d y=%d t=%lu (+%lu ms since previous click)\n",
+                  (int)touch.x, (int)touch.y, millis(),
+                  lastClickMillis == 0 ? 0UL : millis() - lastClickMillis);
+    lastClickMillis = millis();
 
     bool tappedAckPrompt = (currentPage == PAGE_NWS_ALERTS &&
                              nwsFirstAlertNeedsAlert &&
