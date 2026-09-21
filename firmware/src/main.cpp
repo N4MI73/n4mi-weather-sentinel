@@ -60,6 +60,9 @@ int nwsAlertCount = 0;
 String nwsFirstAlertEvent = "";
 String nwsFirstAlertExpires = "";
 String nwsFirstAlertInstruction = "";
+String nwsFirstAlertId = "";
+bool nwsFirstAlertAcknowledged = false;
+bool nwsFirstAlertNeedsAlert = false;
 
 bool hasEverFetchedSuccessfully = false;
 bool timeSynced = false;  // set by syncTimeNTP(), defined near connectWiFi()
@@ -273,9 +276,13 @@ void drawNowPage() {
 // Now's dedicated footer/banner uses, which secondary pages need for
 // their own content instead.
 
+// Shared by drawPersistentStrip(), drawAckPrompt(), and the touch
+// handler in loop() -- defined once so the drawn region and the
+// touch-detection region can never drift out of sync with each other.
+const int BOTTOM_BAR_Y = 214;
+const int BOTTOM_BAR_H = 26;
+
 void drawPersistentStrip() {
-  const int stripY = 214;
-  const int stripH = 26;
   uint16_t bg, textColor;
   String msg;
 
@@ -303,12 +310,27 @@ void drawPersistentStrip() {
     msg = "No active alerts";
   }
 
-  M5.Display.fillRect(0, stripY, 320, stripH, bg);
-  M5.Display.drawFastHLine(0, stripY, 320, COLOR_SEPARATOR);
+  M5.Display.fillRect(0, BOTTOM_BAR_Y, 320, BOTTOM_BAR_H, bg);
+  M5.Display.drawFastHLine(0, BOTTOM_BAR_Y, 320, COLOR_SEPARATOR);
   M5.Display.setTextDatum(middle_left);
   M5.Display.setTextColor(textColor, bg);
   M5.Display.setTextSize(1);
-  M5.Display.drawString(msg, 12, stripY + stripH / 2);
+  M5.Display.drawString(msg, 12, BOTTOM_BAR_Y + BOTTOM_BAR_H / 2);
+}
+
+void drawAckPrompt() {
+  // Replaces the persistent strip's usual space on the NWS Alerts page
+  // specifically while there's an active alert needing acknowledgement
+  // -- the ack action is more useful here than the strip's normal
+  // (redundant, since the alert's own detail is already on screen)
+  // summary text. Same region as the strip so the touch handler in
+  // loop() only needs one consistent rectangle to check against.
+  M5.Display.fillRect(0, BOTTOM_BAR_Y, 320, BOTTOM_BAR_H, COLOR_WARNING_BG);
+  M5.Display.drawFastHLine(0, BOTTOM_BAR_Y, 320, COLOR_SEPARATOR);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(COLOR_WARNING_TEXT_HEADLINE, COLOR_WARNING_BG);
+  M5.Display.setTextSize(2);
+  M5.Display.drawString("TAP TO ACKNOWLEDGE", 160, BOTTOM_BAR_Y + BOTTOM_BAR_H / 2);
 }
 
 // ---- Secondary pages: real content, matching approved mockups ----
@@ -674,6 +696,11 @@ void renderPage(Page p) {
       break;
     case PAGE_NWS_ALERTS:
       drawNwsAlertsPage();
+      if (nwsFirstAlertNeedsAlert) {
+        drawAckPrompt();
+        return;  // replaces the normal strip only while there's
+                  // something on this page to acknowledge
+      }
       break;
     case PAGE_STATUS:
       drawStatusPage();
@@ -808,6 +835,7 @@ String formatCurrentTime() {
 // real added complexity, deliberately deferred to the failure-state-
 // handling pass rather than solved here.
 const char *SERVER_URL = "http://192.168.6.29:8085/api/conditions";
+const char *ACK_URL = "http://192.168.6.29:8085/api/alerts/ack";
 
 void fetchConditions() {
   if (WiFi.status() != WL_CONNECTED) {
@@ -867,10 +895,16 @@ void fetchConditions() {
     nwsFirstAlertEvent = alerts[0]["event"].as<String>();
     nwsFirstAlertExpires = alerts[0]["expires"].as<String>();
     nwsFirstAlertInstruction = alerts[0]["instruction"].as<String>();
+    nwsFirstAlertId = alerts[0]["id"].as<String>();
+    nwsFirstAlertAcknowledged = alerts[0]["acknowledged"];
+    nwsFirstAlertNeedsAlert = alerts[0]["needs_alert"];
   } else {
     nwsFirstAlertEvent = "";
     nwsFirstAlertExpires = "";
     nwsFirstAlertInstruction = "";
+    nwsFirstAlertId = "";
+    nwsFirstAlertAcknowledged = false;
+    nwsFirstAlertNeedsAlert = false;
   }
 
   hasEverFetchedSuccessfully = true;
@@ -882,6 +916,41 @@ void fetchConditions() {
                 tempestWindDir.c_str());
   Serial.printf("[fetch]   lightning.level=%s  nws.available=%s  alerts=%d\n",
                 lightningLevel.c_str(), nwsAvailable ? "true" : "false", nwsAlertCount);
+}
+
+// Phase 2g: alert acknowledgement. Same blocking-HTTP characteristic as
+// fetchConditions() above, but user-triggered rather than on a 60s
+// timer, so the impact is a single brief pause on tap rather than a
+// recurring background one.
+void ackAlert(const String &alertId) {
+  if (WiFi.status() != WL_CONNECTED || alertId.length() == 0) {
+    Serial.println("[ack] Skipped -- no Wi-Fi or no alert id");
+    return;
+  }
+
+  Serial.printf("[ack] Acknowledging alert %s...\n", alertId.c_str());
+  HTTPClient http;
+  http.begin(ACK_URL);
+  http.addHeader("Content-Type", "application/json");
+
+  JsonDocument doc;
+  doc["id"] = alertId;
+  String body;
+  serializeJson(doc, body);
+
+  int httpCode = http.POST(body);
+  if (httpCode == 200) {
+    Serial.println("[ack] Success.");
+    // Optimistic local update -- the next periodic fetch (up to 60s
+    // away) will reconcile with the server's authoritative state, but
+    // there's no reason to make the person wait that long to see the
+    // prompt disappear after they just tapped it.
+    nwsFirstAlertAcknowledged = true;
+    nwsFirstAlertNeedsAlert = false;
+  } else {
+    Serial.printf("[ack] FAILED, code: %d -- prompt stays up, can retry\n", httpCode);
+  }
+  http.end();
 }
 
 void setup() {
@@ -929,13 +998,24 @@ void loop() {
   // M5Unified's own touch_detail_t source before using it here.
   if (touch.wasClicked() && !longPressHandled) {
     lastActivityTime = millis();
-    if (currentPage == PAGE_SETTINGS) {
-      currentPage = PAGE_NOW;
+
+    bool tappedAckPrompt = (currentPage == PAGE_NWS_ALERTS &&
+                             nwsFirstAlertNeedsAlert &&
+                             touch.y >= BOTTOM_BAR_Y &&
+                             touch.y < BOTTOM_BAR_Y + BOTTOM_BAR_H);
+
+    if (tappedAckPrompt) {
+      ackAlert(nwsFirstAlertId);
+      renderPage(currentPage);  // redraw -- prompt disappears if the ack succeeded
     } else {
-      currentPage = (Page)((currentPage + 1) % NUM_CYCLE_PAGES);
+      if (currentPage == PAGE_SETTINGS) {
+        currentPage = PAGE_NOW;
+      } else {
+        currentPage = (Page)((currentPage + 1) % NUM_CYCLE_PAGES);
+      }
+      Serial.printf("Tap -- now on page %d\n", (int)currentPage);
+      renderPage(currentPage);
     }
-    Serial.printf("Tap -- now on page %d\n", (int)currentPage);
-    renderPage(currentPage);
   }
 
   // Idle auto-return to Now
