@@ -155,17 +155,51 @@ String formatAgeString() {
   return String(elapsedSec / 60) + "m ago";
 }
 
-String extractTimeFromIso(const String &iso) {
-  // Crude substring extraction, e.g. "2026-09-20T21:45:00-04:00" -> "21:45".
-  // NWS already returns this in the correct local offset, so no timezone
-  // math is needed -- just not converted to 12-hour AM/PM format yet.
-  // Placeholder until real time handling (NTP, a later step) exists;
-  // genuinely untested against a real alert since none has occurred.
-  int tIndex = iso.indexOf('T');
-  if (tIndex == -1 || (int)iso.length() < tIndex + 6) {
+// Formats an NWS timestamp such as "2026-09-21T16:30:00-04:00" for display
+// next to the local clock: "4:30 PM" if it is today, "Tue 4:30 AM" if it
+// is another day (an overnight alert must not read as if it ends "today").
+// NWS already sends the zone's own local offset, so the digits are used as
+// written -- no timezone math beyond the day-of-week lookup. `nowEpoch` is
+// passed in (0 = clock not synced) so this can be tested exactly.
+String formatAlertTime(const String &iso, time_t nowEpoch) {
+  int t = iso.indexOf('T');
+  if (t < 10 || (int)iso.length() < t + 6) return "unknown time";
+  int year = iso.substring(0, 4).toInt();
+  int mon  = iso.substring(5, 7).toInt();
+  int day  = iso.substring(8, 10).toInt();
+  int hh   = iso.substring(t + 1, t + 3).toInt();
+  int mm   = iso.substring(t + 4, t + 6).toInt();
+  if (year < 2000 || mon < 1 || mon > 12 || day < 1 || day > 31 || hh > 23 || mm > 59) {
     return "unknown time";
   }
-  return iso.substring(tIndex + 1, tIndex + 6);
+
+  int h12 = hh % 12;
+  if (h12 == 0) h12 = 12;
+  char clock[20];
+  snprintf(clock, sizeof(clock), "%d:%02d %s", h12, mm, hh >= 12 ? "PM" : "AM");
+
+  if (nowEpoch <= 0) return String(clock);   // clock not synced: time only
+
+  struct tm when = {};
+  when.tm_year = year - 1900;
+  when.tm_mon = mon - 1;
+  when.tm_mday = day;
+  when.tm_hour = hh;
+  when.tm_min = mm;
+  when.tm_isdst = -1;
+  mktime(&when);                             // fills in tm_wday
+
+  struct tm today;
+  localtime_r(&nowEpoch, &today);
+  if (today.tm_year == year - 1900 && today.tm_mon == mon - 1 && today.tm_mday == day) {
+    return String(clock);
+  }
+  static const char *const DAYS[7] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+  return String(DAYS[when.tm_wday]) + " " + String(clock);
+}
+
+String formatAlertTimeNow(const String &iso) {
+  return formatAlertTime(iso, timeSynced ? time(nullptr) : (time_t)0);
 }
 
 String formatUptimeString() {
@@ -306,8 +340,14 @@ void drawLightningBanner(const String &levelText) {
   M5.Display.drawString(levelText, 26, 158);
 }
 
+// The Now-screen alert footer. Defined once and shared by the drawing code
+// and the touch handler, so the region drawn and the region that reacts to
+// a tap can never drift apart (same pattern as the acknowledge bar).
+const int NOW_FOOTER_Y = 196;
+const int NOW_FOOTER_H = 44;
+
 void drawNwsWarningFooter(const String &eventText, const String &untilText) {
-  M5.Display.fillRect(0, 196, 320, 44, COLOR_WARNING_BG);
+  M5.Display.fillRect(0, NOW_FOOTER_Y, 320, NOW_FOOTER_H, COLOR_WARNING_BG);
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextColor(COLOR_WARNING_TEXT_HEADLINE, COLOR_WARNING_BG);
   String eventName = shortenEventName(eventText);
@@ -404,7 +444,7 @@ void drawNowPage() {
   } else if (nwsView == NWS_VIEW_CLEAR) {
     drawNwsFooterClear();
   } else {
-    String untilText = "Until " + extractTimeFromIso(nwsFirstAlertExpires) +
+    String untilText = "Until " + formatAlertTimeNow(nwsFirstAlertExpires) +
                         (nwsView == NWS_VIEW_ALERT_STALE ? " -- status not current"
                                                           : " -- tap for details");
     drawNwsWarningFooter(nwsFirstAlertEvent, untilText);
@@ -806,7 +846,7 @@ void drawNwsAlertsPage() {
   M5.Display.setTextColor(COLOR_WARNING_TEXT_DETAIL, COLOR_WARNING_BG);
   // Crude time extraction, same placeholder as elsewhere -- real
   // relative/12-hour formatting needs NTP (a separate step).
-  String untilText = "Until " + extractTimeFromIso(nwsFirstAlertExpires);
+  String untilText = "Until " + formatAlertTimeNow(nwsFirstAlertExpires);
   if (nwsView == NWS_VIEW_ALERT_STALE) untilText += "  -- status not current";
   M5.Display.drawString(untilText, 24, 72);
 
@@ -1326,9 +1366,21 @@ void loop() {
                              touch.y >= BOTTOM_BAR_Y &&
                              touch.y < BOTTOM_BAR_Y + BOTTOM_BAR_H);
 
+    // The Now footer says "tap for details" -- so a tap on the footer band
+    // must actually go to the NWS Alerts page (a plain tap elsewhere still
+    // advances one page, as always).
+    NwsView tapNwsView = currentNwsView();
+    bool tappedNowAlertFooter = (currentPage == PAGE_NOW &&
+                                 (tapNwsView == NWS_VIEW_ALERT || tapNwsView == NWS_VIEW_ALERT_STALE) &&
+                                 touch.y >= NOW_FOOTER_Y);
+
     if (tappedAckPrompt) {
       ackAlert(nwsFirstAlertId);
       renderPage(currentPage);  // redraw -- prompt disappears if the ack succeeded
+    } else if (tappedNowAlertFooter) {
+      currentPage = PAGE_NWS_ALERTS;
+      Serial.println("Tap on Now alert footer -- jumping to NWS Alerts");
+      renderPage(currentPage);
     } else {
       if (currentPage == PAGE_SETTINGS) {
         currentPage = PAGE_NOW;
