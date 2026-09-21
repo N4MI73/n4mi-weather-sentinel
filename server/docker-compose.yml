@@ -36,4 +36,4 @@ services:
       - /volume2/docker/weather-sentinel/data:/data
     environment:
       - NWS_CONTACT_INFO=${NWS_CONTACT_INFO}
-      - LIGHTNING_FILTER_RADIUS_MI=${LIGHTNING_FILTER_RADIUS_MI:-10
+      - LIGHTNING_FILTER_RADIUS_MI=${LIGHTNING_FILTER_RADIUS_MI:-10}
