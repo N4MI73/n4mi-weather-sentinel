@@ -21,9 +21,10 @@ when conditions actually warrant it. It's explicitly **supplemental** — Wirele
 Alerts, weather apps, NOAA Weather Radio, and other existing warning methods remain
 independent and are never represented as replaced.
 
-![Now screen with lightning and NWS alert notifications](images/1b_now_lightning.png)
-![Wind & Rain information screen](images/2_wind-rain.png)
+![Now screen with lightning and NWS alert notifications](images/1b_now_lightning_NWS_alert.png)
+![Wind & Rain information screen](images/2_wind_rain.png)
 ![Lightning information screen](images/3_lightning.png)
+![NWS Alert screen](images/4_alert.png)
 ![Status screen](images/5_status.png)
 
 ## How it's built
