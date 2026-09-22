@@ -1,10 +1,14 @@
 # Weather Sentinel
 
+![Now screen showing high feels-like temperature](images/1a_now_feels_like.png)
+
 A bedside weather and alert appliance built on the M5Stack CoreS3 SE. It answers three
 questions without becoming a full weather platform:
 
 1. **What's happening in the yard right now?** — real-time conditions from a WeatherFlow
-   Tempest station (temperature, humidity, wind, gust, rain, station pressure).
+   Tempest station (temperature, feels-like, humidity, wind, gust, rain rate, station
+   pressure), using WeatherFlow's own published formulas so the numbers agree with the
+   Tempest phone app.
 2. **Is a locally measured condition becoming noteworthy?** — Tempest-derived threshold
    events, starting with nearby lightning (filtered to within 10 miles, classified as
    sporadic or frequent rather than shown as raw numbers).
@@ -16,6 +20,11 @@ The device stays dark and quiet during ordinary bedroom use and becomes conspicu
 when conditions actually warrant it. It's explicitly **supplemental** — Wireless Emergency
 Alerts, weather apps, NOAA Weather Radio, and other existing warning methods remain
 independent and are never represented as replaced.
+
+![Now screen with lightning and NWS alert notifications](images/1b_now_lightning.png)
+![Wind & Rain information screen](images/2_wind-rain.png)
+![Lightning information screen](images/3_lightning.png)
+![Status screen](images/5_status.png)
 
 ## How it's built
 
@@ -36,22 +45,48 @@ overnight.
 
 ## Current status
 
-Both the firmware and server are real, deployed, and talking to each other:
+The firmware and server are deployed, connected, and have both been exercised against
+real conditions, not just simulated ones:
 
-- All five screens display live data on real hardware.
-- The server is deployed on the NAS, has survived a real container restart without
-  losing alert state, and correctly distinguishes "no active alerts" from "couldn't
-  check" — the latter is never allowed to look like the former.
-- Lightning's distance filter and rate classification, and the NWS alert lifecycle
-  state machine, are both built and tested, though real-world validation against an
-  actual storm or active alert hasn't happened yet — that can't be forced.
-- Firmware-side alert acknowledgement isn't wired up yet; the device currently reads and
-  displays alert content but doesn't yet mark alerts as acknowledged.
+- All five screens display live data on real hardware — including a real NWS alert
+  (received, displayed, acknowledged, and correctly not re-sounded after a server
+  restart) and real lightning strikes.
+- Alert acknowledgement is wired up end to end: a tap on the device calls the server's
+  ack endpoint, and the acknowledgement survives a server redeploy.
+- The server distinguishes "no active alerts" from "couldn't check," and the firmware
+  carries that distinction through to every screen via a shared set of freshness rules —
+  stale data is never allowed to read as a fresh "clear."
+- Wi-Fi loss is handled automatically: the device retries on its own schedule, resyncs
+  its clock on reconnect, and forces an immediate data refresh rather than waiting on an
+  unrelated timer, with a reboot only as a last resort after 10 minutes of continuous
+  failure — confirmed by physically walking the device out of Wi-Fi range and back.
+- Both the UDP listener (Tempest) and the NWS poller survive malformed or unexpected
+  data without stopping.
 
-For exact per-session status, hardware validation detail, the full API contract, and a
-complete decision history, see `Weather_Sentinel_Project_Brief.md` at the repo root —
-that file, not this one, is the authoritative operational source of truth for the
-project.
+**Not yet built** (see "Planned upgrades" below): night dimming, audio, an on-device
+Settings page, a simulation/test mode, and alert severity-aware display (today every
+active alert looks equally urgent, regardless of how serious it actually is).
+
+## Planned upgrades
+
+Roughly in build order (see the project brief, §24, for the full v1.0 definition and
+acceptance tests):
+
+1. **Wi-Fi/NTP reconnect** — done (above). **Simulation/test mode** — not yet built; the
+   only way to exercise long alerts, multiple alerts, escalation, and acknowledgement on
+   the physical screen without waiting for real weather.
+2. **Night dimming and a minimal on-device Settings page** — volume, day/night
+   brightness with a night schedule, temporary mute, and a "run test alert" control. A
+   4-page mockup has been reviewed; not yet built.
+3. **Audio** — tones by alert level, silenced by acknowledgement, with volume, quiet
+   hours, and an always-visible mute state.
+4. **Alert priority and severity** — show the highest-priority alert first when more than
+   one is active, and vary color by severity so a minor statement doesn't look like a
+   tornado warning.
+
+**After v1.0:** ambient alert-color LEDs (an M5GO-BOTTOM3 add-on), matching alerts to
+the device's exact location rather than the whole county, and a captive portal for Wi-Fi
+setup (replacing the current gitignored-header approach below).
 
 ## Repo layout
 
@@ -79,12 +114,17 @@ platformio run -d "D:\Documents\GitHub\n4mi-weather-sentinel\firmware" -t upload
 ```
 
 Copy `firmware/src/wifi_credentials.h.example` to `wifi_credentials.h` and fill in real
-Wi-Fi credentials before building — this stopgap will eventually be replaced by an
-on-device captive portal for real bedside deployment.
+Wi-Fi credentials **and** `SERVER_BASE_URL` (your server's LAN address and port, e.g.
+`http://192.168.1.50:8085`, no trailing slash) before building — the build fails with a
+clear error if `SERVER_BASE_URL` is missing. This stopgap will eventually be replaced by
+an on-device captive portal for real bedside deployment.
 
 ## Running the server
 
 Deployed via Portainer's Repository build method (see the project brief for the exact
 walkthrough). Requires one environment variable, `NWS_CONTACT_INFO`, in the format NWS
-requests: `(appname, contact@email.com)`. No API keys or tokens are needed for either
-Tempest or NWS.
+requests: `(appname, contact@email.com)`. An optional `LIGHTNING_FILTER_RADIUS_MI`
+(default 10) sets the lightning distance cutoff in miles; the compose file must pass
+Portainer's value through (`LIGHTNING_FILTER_RADIUS_MI=${LIGHTNING_FILTER_RADIUS_MI:-10}`
+under `environment:`) or it never reaches the container. No API keys or tokens are
+needed for either Tempest or NWS.
