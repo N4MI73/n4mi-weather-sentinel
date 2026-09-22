@@ -1229,6 +1229,15 @@ void handleWifiAndNtpReconnect() {
       wifiRetryIndex = 0;
       syncTimeNTP();  // resync -- an outage this long may have drifted the clock
       lastNtpAttemptMillis = now;
+      // Force the next periodic conditions-fetch to happen on the very
+      // next loop() pass, rather than waiting up to FETCH_INTERVAL_MS
+      // (60s) for its own independent timer. Confirmed needed on real
+      // hardware (Session 9): without this, Wi-Fi could report back
+      // while Backend still showed "Unreachable" for up to another
+      // minute, simply waiting its turn on an unrelated clock. Uses
+      // subtraction (not a bare 0) so it stays correct even very soon
+      // after boot, matching the wraparound-safe pattern used elsewhere.
+      lastFetchAttemptMillis = now - FETCH_INTERVAL_MS - 1;
     } else if (now - lastNtpAttemptMillis >= NTP_PERIODIC_RESYNC_MS) {
       // Periodic safety resync even without a disconnect.
       Serial.println("[ntp] Periodic resync (no disconnect occurred).");
