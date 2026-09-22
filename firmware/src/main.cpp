@@ -481,14 +481,27 @@ void drawPersistentStrip() {
     textColor = COLOR_WARNING_TEXT_HEADLINE;
     msg = nwsFirstAlertEvent;
     if (nwsView == NWS_VIEW_ALERT_STALE) msg += " (status not current)";
+  } else if (WiFi.status() != WL_CONNECTED) {
+    // Checked directly against WiFi.status(), not inferred from a stale
+    // fetch -- so this can say "Wi-Fi" specifically rather than the
+    // generic "unknown" a dead backend would also produce. An active
+    // alert still always wins (above), matching the rule that an alert
+    // is never hidden even when everything else is failing.
+    bg = COLOR_BG;
+    textColor = COLOR_STATUS_BAD;
+    msg = "Wi-Fi disconnected";
   } else if (currentLightningView() == LIGHTNING_ACTIVE) {
     bg = COLOR_LIGHTNING_BG;
     textColor = COLOR_LIGHTNING_TEXT;
     msg = (lightningLevel == "frequent") ? "Frequent lightning nearby" : "Lightning nearby";
   } else if (nwsView == NWS_VIEW_UNKNOWN) {
+    // Wi-Fi is fine (checked above) but the server or NWS itself isn't
+    // answering -- a different problem to troubleshoot than "Wi-Fi
+    // disconnected" above, so it keeps its own distinct wording rather
+    // than collapsing into one generic "unknown" message.
     bg = COLOR_BG;
     textColor = COLOR_TEXT_DIM;
-    msg = "NWS status unknown";
+    msg = "Server unreachable";
   } else {
     bg = COLOR_BG;
     textColor = COLOR_NWS_CLEAR_TEXT;
@@ -1128,6 +1141,8 @@ void renderPage(Page p) {
 // static/dummy content exactly as before.
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000;
 
+void syncTimeNTP();  // defined below; called from the reconnect logic ahead of its own definition
+
 void connectWiFi() {
   Serial.println();
   Serial.printf("Connecting to Wi-Fi: %s", WIFI_SSID);
@@ -1152,6 +1167,112 @@ void connectWiFi() {
     Serial.println("Check wifi_credentials.h has the correct SSID/password,");
     Serial.println("and that the network is 2.4GHz -- the CoreS3 SE's");
     Serial.println("Wi-Fi radio does not support 5GHz networks at all.");
+  }
+}
+
+// ---- Reconnect logic (v1.0 requirement, §24) ----
+//
+// setup() calls connectWiFi()/syncTimeNTP() once, blocking, as before --
+// this section covers everything AFTER that: what happens when Wi-Fi
+// drops mid-operation, which a power outage makes likely (the router
+// often comes back slower than this device does).
+//
+// Cadence, confirmed with Dan: retry at 10s, 30s, 60s after the drop is
+// first noticed, then hold at 60s -- Wi-Fi outages are binary (the
+// router is up or it isn't), so backing off further than 60s buys
+// nothing. After WIFI_REBOOT_AFTER_MS (10 minutes) of continuous
+// failure, reboot as a last resort -- a stuck radio/driver state is the
+// scenario this guards against, not a slow router.
+//
+// NTP rides along with Wi-Fi: a resync is attempted right after any
+// reconnect that follows a real disconnect, plus a periodic safety
+// resync on its own timer regardless (continued background resync
+// beyond the boot-time sync was only ever assumed, never confirmed --
+// §17).
+const unsigned long WIFI_RETRY_SCHEDULE_MS[] = {10000, 30000, 60000};
+const int WIFI_RETRY_SCHEDULE_LEN = 3;
+const unsigned long WIFI_RETRY_HOLD_MS = 60000;   // cadence once past the schedule
+const unsigned long WIFI_REBOOT_AFTER_MS = 600000;  // 10 minutes, confirmed with Dan
+const unsigned long NTP_PERIODIC_RESYNC_MS = 4UL * 60 * 60 * 1000;  // 4 hours, placeholder
+
+bool wifiWasConnected = true;        // setup()'s blocking connect already ran
+unsigned long wifiDownSinceMillis = 0;       // 0 = currently connected
+unsigned long wifiLastRetryMillis = 0;
+int wifiRetryIndex = 0;
+unsigned long lastNtpAttemptMillis = 0;
+
+// Non-blocking: kicks off one connection attempt (WiFi.begin) and returns
+// immediately. Unlike connectWiFi(), this never delays the loop -- the
+// actual connection happens in the background; wifiWasConnected below is
+// what notices success on a later loop() pass.
+void beginWifiReconnectAttempt() {
+  Serial.println("[wifi] Reconnect attempt starting...");
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
+// Called every loop(). Detects disconnects, retries on the schedule
+// above without blocking, resyncs NTP after a real reconnect, does the
+// periodic safety NTP resync, and reboots after prolonged failure.
+void handleWifiAndNtpReconnect() {
+  bool connectedNow = (WiFi.status() == WL_CONNECTED);
+  unsigned long now = millis();
+
+  if (connectedNow) {
+    if (!wifiWasConnected) {
+      // Just came back from a real outage.
+      unsigned long downFor = now - wifiDownSinceMillis;
+      Serial.printf("[wifi] Reconnected after %lu ms. RSSI %d dBm.\n",
+                    downFor, WiFi.RSSI());
+      wifiWasConnected = true;
+      wifiDownSinceMillis = 0;
+      wifiRetryIndex = 0;
+      syncTimeNTP();  // resync -- an outage this long may have drifted the clock
+      lastNtpAttemptMillis = now;
+    } else if (now - lastNtpAttemptMillis >= NTP_PERIODIC_RESYNC_MS) {
+      // Periodic safety resync even without a disconnect.
+      Serial.println("[ntp] Periodic resync (no disconnect occurred).");
+      syncTimeNTP();
+      lastNtpAttemptMillis = now;
+    }
+    return;
+  }
+
+  // Not connected.
+  if (wifiWasConnected) {
+    // Just noticed the drop.
+    Serial.println("[wifi] Connection LOST. Will retry at 10s, 30s, 60s, then every 60s.");
+    wifiWasConnected = false;
+    wifiDownSinceMillis = now;
+    wifiRetryIndex = 0;
+    wifiLastRetryMillis = now;
+    return;  // first retry happens on a later pass, per the schedule below
+  }
+
+  unsigned long downFor = now - wifiDownSinceMillis;
+  if (downFor >= WIFI_REBOOT_AFTER_MS) {
+    // Last resort: 10 minutes of continuous failure. A stuck Wi-Fi
+    // driver/radio state is what this guards against -- a genuine
+    // router/NAS outage will still be down after the reboot too, and
+    // the device will just keep retrying from a clean state instead of
+    // silently sitting there.
+    Serial.println("[wifi] Down for 10+ minutes. Rebooting as a last resort.");
+    delay(100);  // let the serial line flush
+    ESP.restart();
+  }
+
+  unsigned long dueAt;
+  if (wifiRetryIndex < WIFI_RETRY_SCHEDULE_LEN) {
+    dueAt = wifiDownSinceMillis + WIFI_RETRY_SCHEDULE_MS[wifiRetryIndex];
+  } else {
+    dueAt = wifiLastRetryMillis + WIFI_RETRY_HOLD_MS;
+  }
+
+  if (now >= dueAt) {
+    Serial.printf("[wifi] Retry #%d (down %lu ms)\n", wifiRetryIndex + 1, downFor);
+    beginWifiReconnectAttempt();
+    wifiLastRetryMillis = now;
+    if (wifiRetryIndex < WIFI_RETRY_SCHEDULE_LEN) wifiRetryIndex++;
   }
 }
 
@@ -1513,6 +1634,10 @@ void loop() {
       renderPage(currentPage);
     }
   }
+
+  // Wi-Fi/NTP reconnect -- non-blocking, runs every pass regardless of
+  // which page is showing (v1.0 requirement, §24).
+  handleWifiAndNtpReconnect();
 
   // Idle auto-return to Now
   if (currentPage != PAGE_NOW &&
