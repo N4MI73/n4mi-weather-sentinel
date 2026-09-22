@@ -230,7 +230,16 @@ static uint16_t COLOR_BG, COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY, COLOR_TEXT_D
     COLOR_SEPARATOR, COLOR_NWS_CLEAR_DOT, COLOR_NWS_CLEAR_TEXT,
     COLOR_LIGHTNING_BG, COLOR_LIGHTNING_BORDER, COLOR_LIGHTNING_TEXT,
     COLOR_WARNING_BG, COLOR_WARNING_TEXT_HEADLINE, COLOR_WARNING_TEXT_DETAIL,
-    COLOR_LABEL, COLOR_STATUS_BAD;
+    COLOR_LABEL, COLOR_STATUS_BAD,
+    // Feels-like temperature bands (Session 9). Cold colors and the
+    // orange band are new; yellow/amber reuses the lightning color and
+    // red reuses COLOR_STATUS_BAD, both already visually correct for
+    // their meaning. An initial attempt reused COLOR_WARNING_TEXT_DETAIL
+    // for orange, but rendered as a dusty pink too close in hue to red
+    // to read as a distinct, graduated step -- replaced with a real
+    // orange after a side-by-side render caught it. "Plain" (50-79F) is
+    // just COLOR_TEXT_SECONDARY, unchanged -- no new constant needed.
+    COLOR_FEELS_COLD, COLOR_FEELS_COOL, COLOR_FEELS_ORANGE;
 
 void initColors() {
   COLOR_BG               = M5.Display.color565(0x04, 0x04, 0x04);
@@ -248,6 +257,9 @@ void initColors() {
   COLOR_WARNING_TEXT_DETAIL   = M5.Display.color565(0xe0, 0x8a, 0x8a);
   COLOR_LABEL             = M5.Display.color565(0x6a, 0x6a, 0x6a);
   COLOR_STATUS_BAD        = M5.Display.color565(0xcc, 0x33, 0x33);
+  COLOR_FEELS_COLD        = M5.Display.color565(0x5a, 0x9a, 0xe0);
+  COLOR_FEELS_COOL        = M5.Display.color565(0x8a, 0xc8, 0xe0);
+  COLOR_FEELS_ORANGE      = M5.Display.color565(0xe0, 0x7a, 0x1a);
 }
 
 // ---- Now screen ----
@@ -289,14 +301,20 @@ void drawCommonHeader(const char *timeStr, const char *ageStr) {
 }
 
 void drawConditions(const char *tempStr, const char *feelsStr, const char *humidStr,
-                     const char *windStr, const char *gustStr, const char *rainStr) {
+                     const char *windStr, const char *gustStr, const char *rainStr,
+                     uint16_t feelsColor) {
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextColor(COLOR_TEXT_PRIMARY, COLOR_BG);
   M5.Display.setTextSize(4);
   M5.Display.drawString(tempStr, 16, 55);
   M5.Display.setTextSize(2);
-  M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
+  // Feels-like gets its own color (the band color); humidity stays plain.
+  // Air temperature above is deliberately NOT colored -- Dan's Session 8
+  // choice was to color feels-like specifically, since that is the number
+  // that changes what you'd actually do before heading outside.
+  M5.Display.setTextColor(feelsColor, COLOR_BG);
   M5.Display.drawString(feelsStr, 150, 58);
+  M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
   M5.Display.drawString(humidStr, 150, 78);
   M5.Display.drawFastHLine(16, 98, 288, COLOR_SEPARATOR);
   M5.Display.setTextSize(2);
@@ -374,6 +392,58 @@ void drawNwsFooterUnknown() {
   M5.Display.drawString("NWS STATUS UNKNOWN", 34, 204);
 }
 
+// Feels-like colour bands, tuned by Dan to how these temperatures
+// actually feel to him in Georgia (Session 9; supersedes the original
+// Session 8 proposal). Bands: <=39 blue, 40-54 light blue, 55-74 plain
+// (no color change), 75-86 yellow, 87-94 orange, >=95 red. A 1F buffer
+// prevents flicker at a boundary: moving to an adjacent band requires
+// crossing 1F PAST that band's edge, not just touching it.
+//
+// Dan's stated ranges overlapped by 1F at the yellow/orange edge ("75-87
+// yellow", "87-94 orange"); resolved as orange starting at 87 (matching
+// his explicit "87-94"), so yellow is 75-86. Flagged for Dan rather than
+// silently guessed -- worth a one-degree correction if that's not what
+// he meant, though the 1F buffer already makes a single degree here
+// nearly imperceptible in practice.
+//
+// FEELS_BAND_COUNT bands, indices 0..5; FEELS_BAND_BOUNDARIES holds the
+// 5 edges between them (40, 55, 75, 87, 95) -- each value is the first
+// degree belonging to the band above it.
+const int FEELS_BAND_COUNT = 6;
+const float FEELS_BAND_BOUNDARIES[FEELS_BAND_COUNT - 1] = {40, 55, 75, 87, 95};
+const float FEELS_BAND_BUFFER = 1.0f;
+
+// Stateful on purpose: the caller passes in the previously-shown band
+// and gets back the (possibly unchanged) new one. Kept as a plain
+// function taking/returning an int, not a hidden static, so it can be
+// tested directly with arbitrary sequences of readings.
+int feelsLikeBand(float feelsF, int lastBand) {
+  int band = lastBand;
+  // Step down while clearly (by the buffer) below the current band's
+  // lower edge; step up while clearly above its upper edge. Each step
+  // re-checks against the NEW current band's own edge, so a large jump
+  // (e.g. after a restart, or a big real swing) still lands correctly
+  // rather than only ever moving one band per reading.
+  while (band > 0 && feelsF < FEELS_BAND_BOUNDARIES[band - 1] - FEELS_BAND_BUFFER) {
+    band--;
+  }
+  while (band < FEELS_BAND_COUNT - 1 && feelsF >= FEELS_BAND_BOUNDARIES[band] + FEELS_BAND_BUFFER) {
+    band++;
+  }
+  return band;
+}
+
+uint16_t feelsLikeBandColor(int band) {
+  switch (band) {
+    case 0: return COLOR_FEELS_COLD;      // <=39F
+    case 1: return COLOR_FEELS_COOL;      // 40-54F
+    case 2: return COLOR_TEXT_SECONDARY;  // 55-74F, plain
+    case 3: return COLOR_LIGHTNING_TEXT;  // 75-86F, yellow/amber (reused)
+    case 4: return COLOR_FEELS_ORANGE;    // 87-94F, orange
+    default: return COLOR_STATUS_BAD;     // >=95F, red (reused)
+  }
+}
+
 // Tempest's rain-intensity words, from the server's rain_rate_level. An
 // unknown or missing level shows "--" rather than a guess.
 const char *rainLevelLabel(const String &level) {
@@ -393,6 +463,13 @@ const char *rainLevelLabel(const String &level) {
 int fitTextSize(const char *text, int maxWidth) {
   return ((int)strlen(text) * 18 <= maxWidth) ? 3 : 2;
 }
+
+// Persisted across calls so feelsLikeBand()'s hysteresis has continuity
+// from one fetch to the next; -1 means "no reading shown yet", which
+// feelsLikeBand() treats as band 0 on the first real call (an initial
+// snap to the correct band, not eased in -- there's nothing to flicker
+// against yet).
+int lastFeelsLikeBand = -1;
 
 void drawNowPage() {
   // Real clock now comes from NTP sync (syncTimeNTP(), called once at
@@ -417,8 +494,24 @@ void drawNowPage() {
     // Feels-like comes from the server (WeatherFlow's own definition). If
     // the server didn't send one, the slot stays blank rather than
     // showing a made-up number.
+    uint16_t feelsColor = COLOR_TEXT_SECONDARY;
     if (tempestFeelsLikeValid) {
       snprintf(feelsStr, sizeof(feelsStr), "Feels %.0fF", tempestFeelsLikeF);
+      // First-ever reading (lastFeelsLikeBand == -1) starts the hysteresis
+      // from band 0; every later call starts from the previously-shown
+      // band, so a boundary must be genuinely cleared (not just touched)
+      // to change color.
+      // Color is decided from the ROUNDED value -- the same whole number
+      // shown on screen -- not the raw decimal underneath. Confirmed
+      // needed on real hardware (Session 9): a raw value like 95.6
+      // rounds to display "96F" but had not yet cleared the buffered
+      // 96.0 threshold, so the color stayed orange while the number on
+      // screen said 96 -- confusing, since the two should always agree
+      // on what "96" means. Rounding first makes them consistent.
+      float feelsRounded = roundf(tempestFeelsLikeF);
+      int fromBand = (lastFeelsLikeBand < 0) ? 0 : lastFeelsLikeBand;
+      lastFeelsLikeBand = feelsLikeBand(feelsRounded, fromBand);
+      feelsColor = feelsLikeBandColor(lastFeelsLikeBand);
     } else {
       feelsStr[0] = '\0';
     }
@@ -428,7 +521,7 @@ void drawNowPage() {
     // What is happening NOW: the rain RATE in Tempest's own words, not an
     // accumulation. Numeric detail lives on the Wind & Rain page.
     snprintf(rainStr, sizeof(rainStr), "Rain: %s", rainLevelLabel(tempestRainRateLevel));
-    drawConditions(tempStr, feelsStr, humidStr, windStr, gustStr, rainStr);
+    drawConditions(tempStr, feelsStr, humidStr, windStr, gustStr, rainStr, feelsColor);
   }
 
   if (currentLightningView() == LIGHTNING_ACTIVE) {
