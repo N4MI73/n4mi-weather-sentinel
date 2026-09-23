@@ -28,6 +28,17 @@
 String formatCurrentTime();
 String formatEpochLocal(long epoch);  // defined next to formatCurrentTime()
 
+extern uint8_t DAY_BRIGHTNESS;
+extern uint8_t NIGHT_BRIGHTNESS;
+extern int NIGHT_START_HOUR;
+extern int NIGHT_START_MINUTE;
+extern int NIGHT_END_HOUR;
+extern int NIGHT_END_MINUTE;
+extern int lastAppliedBrightnessMode;
+uint8_t stepBrightness(uint8_t current, int direction);
+void stepScheduleTime(int &hour, int &minute, int direction);
+void applyCurrentBrightnessImmediately();
+
 enum Page {
   PAGE_NOW = 0,
   PAGE_WIND_RAIN,
@@ -37,6 +48,11 @@ enum Page {
   PAGE_SETTINGS
 };
 static const int NUM_CYCLE_PAGES = 5;  // Settings excluded from the cycle
+
+// Forward declaration: the Settings drawing code (below) needs this, but
+// its real definition (the render-timing wrapper) lives later in the
+// file -- same reason and pattern as the forward declarations above.
+void renderPage(Page p);
 
 static Page currentPage = PAGE_NOW;
 
@@ -1186,18 +1202,265 @@ void drawStatusPage() {
   M5.Display.drawString("v0.1.0-dev", 170, y + 16);
 }
 
-void drawSettingsPage() {
+// ---- Settings: 4-page shell (approved mockup, Session 10) ----
+//
+// Nav model: a plain tap anywhere on a main page advances the cycle, but
+// Settings pages are almost entirely covered by real controls, so that
+// convention would collide with them constantly. Instead all Settings-
+// level navigation lives in one place: the bottom bar, split three ways
+// (PREV / DONE / NEXT). The header stays purely informational -- just
+// the title and "n/4" -- matching how every other page's header already
+// behaves, rather than inventing a new meaning for it.
+//
+// Colors reuse the existing palette exactly (approved mockup): amber
+// (COLOR_LIGHTNING_TEXT) for interactive controls, green
+// (COLOR_NWS_CLEAR_TEXT) for normal/off/exit, red (COLOR_STATUS_BAD) for
+// mute-active. No new color constants needed.
+//
+// Geometry constants are shared between the drawing code and the touch
+// handler below, so the region drawn and the region that reacts to a tap
+// can never drift apart -- the same defensive pattern used for the Now
+// footer and the acknowledge bar.
+const int SETTINGS_NAV_Y = 210;
+const int SETTINGS_NAV_H = 30;
+const int SETTINGS_NAV_PREV_X0 = 0, SETTINGS_NAV_PREV_X1 = 64;
+const int SETTINGS_NAV_DONE_X0 = 64, SETTINGS_NAV_DONE_X1 = 256;
+const int SETTINGS_NAV_NEXT_X0 = 256, SETTINGS_NAV_NEXT_X1 = 320;
+
+const int SETTINGS_ROW_STEPPER_H = 64;  // stepper row height + gap, matches the approved mockup
+const int SETTINGS_ROW_BUTTON_H = 58;   // button row height + gap
+const int SETTINGS_LABEL_ONLY_H = 18;   // a bare label line + gap
+
+// Which of the 4 Settings sub-pages is currently showing (0-3). Reset to
+// 0 every time Settings is entered via long-press, so it always starts
+// on Volume + Test Tone rather than remembering where you left off.
+int settingsSubPage = 0;
+const int SETTINGS_NUM_SUBPAGES = 4;
+
+void drawSettingsHeader(const char *title) {
   M5.Display.fillScreen(COLOR_BG);
   M5.Display.setTextDatum(top_left);
-  M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
-  M5.Display.setTextSize(1);
-  M5.Display.drawString("placeholder -- layout pending", 16, 8);
   M5.Display.setTextColor(COLOR_TEXT_PRIMARY, COLOR_BG);
   M5.Display.setTextSize(3);
-  M5.Display.drawString("Settings", 16, 90);
+  M5.Display.drawString(title, 16, 10);
+  char pageLabel[8];
+  snprintf(pageLabel, sizeof(pageLabel), "%d/%d", settingsSubPage + 1, SETTINGS_NUM_SUBPAGES);
+  M5.Display.setTextDatum(top_right);
+  M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+  M5.Display.setTextSize(1);
+  M5.Display.drawString(pageLabel, 304, 14);
+  M5.Display.drawFastHLine(16, 38, 288, COLOR_SEPARATOR);
+}
+
+// A labelled -/+ stepper row. `value` is whatever the current control
+// shows; this function doesn't know or care whether it's backed by a
+// real, live setting yet.
+void drawSettingsStepperRow(int y, const char *label, const String &value) {
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(COLOR_LABEL, COLOR_BG);
+  M5.Display.setTextSize(1);
+  M5.Display.drawString(label, 16, y);
+
+  int boxY = y + 8;
+  M5.Display.drawRoundRect(16, boxY, 36, 30, 4, COLOR_LIGHTNING_TEXT);
+  M5.Display.drawRoundRect(268, boxY, 36, 30, 4, COLOR_LIGHTNING_TEXT);
+  M5.Display.setTextDatum(middle_center);
   M5.Display.setTextSize(2);
-  M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
-  M5.Display.drawString("(tap to return)", 16, 140);
+  M5.Display.setTextColor(COLOR_LIGHTNING_TEXT, COLOR_BG);
+  M5.Display.drawString("-", 34, boxY + 15);
+  M5.Display.drawString("+", 286, boxY + 15);
+  M5.Display.setTextColor(COLOR_TEXT_PRIMARY, COLOR_BG);
+  M5.Display.drawString(value, 160, boxY + 15);
+}
+
+// A full-width rounded button, optionally filled (for an active/on
+// state) with an optional one-line sub-caption below it (used for
+// Mute's "Until 7:00 AM").
+void drawSettingsButtonRow(int y, int h, const String &label, uint16_t color,
+                           bool filled, const String &sub) {
+  uint16_t fillColor = filled ? color : COLOR_BG;
+  uint16_t textColor = filled ? COLOR_BG : color;
+  if (filled) {
+    M5.Display.fillRoundRect(16, y, 288, h, 6, fillColor);
+  }
+  M5.Display.drawRoundRect(16, y, 288, h, 6, color);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(textColor, fillColor);
+  M5.Display.drawString(label, 160, y + h / 2);
+  if (sub.length() > 0) {
+    M5.Display.setTextDatum(top_left);
+    M5.Display.setTextColor(COLOR_STATUS_BAD, COLOR_BG);
+    M5.Display.setTextSize(1);
+    M5.Display.drawString(sub, 16, y + h + 2);
+  }
+}
+
+void drawSettingsNavBar() {
+  M5.Display.fillRect(0, SETTINGS_NAV_Y, 320, SETTINGS_NAV_H, COLOR_BG);
+  M5.Display.drawFastHLine(0, SETTINGS_NAV_Y, 320, COLOR_SEPARATOR);
+  M5.Display.drawFastVLine(SETTINGS_NAV_PREV_X1, SETTINGS_NAV_Y, SETTINGS_NAV_H, COLOR_SEPARATOR);
+  M5.Display.drawFastVLine(SETTINGS_NAV_DONE_X1, SETTINGS_NAV_Y, SETTINGS_NAV_H, COLOR_SEPARATOR);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextSize(2);
+  int midY = SETTINGS_NAV_Y + SETTINGS_NAV_H / 2;
+  M5.Display.setTextColor(COLOR_LIGHTNING_TEXT, COLOR_BG);
+  M5.Display.drawString("<", (SETTINGS_NAV_PREV_X0 + SETTINGS_NAV_PREV_X1) / 2, midY);
+  M5.Display.drawString(">", (SETTINGS_NAV_NEXT_X0 + SETTINGS_NAV_NEXT_X1) / 2, midY);
+  M5.Display.setTextColor(COLOR_NWS_CLEAR_TEXT, COLOR_BG);
+  M5.Display.drawString("DONE", (SETTINGS_NAV_DONE_X0 + SETTINGS_NAV_DONE_X1) / 2, midY);
+}
+
+// 12-hour "H:MM AM/PM" formatting for the schedule page -- same
+// convention as the clock and alert times elsewhere, but taking plain
+// hour/minute integers rather than a timestamp, since a schedule time
+// isn't tied to any particular day.
+String formatHourMinute12(int hour, int minute) {
+  int h12 = hour % 12;
+  if (h12 == 0) h12 = 12;
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%d:%02d %s", h12, minute, hour >= 12 ? "PM" : "AM");
+  return String(buf);
+}
+
+// -- Page 1: Volume + Test Tone --
+// Audio doesn't exist yet (next item after Settings), so this page is
+// visually complete per the approved mockup but genuinely inert: no
+// real volume variable exists to show or change yet. Tapping its
+// controls is logged, not acted on -- an honest placeholder, not a
+// control that silently does nothing without saying so.
+void drawSettingsVolumePage() {
+  drawSettingsHeader("Settings");
+  drawSettingsStepperRow(46, "VOLUME", "--");
+  drawSettingsButtonRow(46 + SETTINGS_ROW_STEPPER_H, 34, "TEST TONE", COLOR_LIGHTNING_TEXT, false, "");
+  drawSettingsNavBar();
+}
+
+// -- Page 2: Mute + Run Test Alert --
+// Same as above: Mute has nothing real to control until audio exists.
+// Run Test Alert is left inert for this same pass -- it's a natural
+// next step (it could call this device's own /api/simulation/start),
+// but that's a separate piece of wiring not yet built here.
+void drawSettingsMutePage() {
+  drawSettingsHeader("Settings");
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(COLOR_LABEL, COLOR_BG);
+  M5.Display.setTextSize(1);
+  M5.Display.drawString("MUTE", 16, 46);
+  drawSettingsButtonRow(46 + SETTINGS_LABEL_ONLY_H, 34, "OFF  (tap to mute)", COLOR_NWS_CLEAR_TEXT, false, "");
+  drawSettingsButtonRow(46 + SETTINGS_LABEL_ONLY_H + SETTINGS_ROW_BUTTON_H, 34,
+                        "RUN TEST ALERT", COLOR_LIGHTNING_TEXT, false, "");
+  drawSettingsNavBar();
+}
+
+// -- Page 3: Brightness (day/night) --
+// Shows the REAL current values from the night-dimming feature (Session
+// 10) -- read-only for now. Values are the raw 0-255 setBrightness()
+// inputs, not a percentage: the hardware only has 9 real distinguishable
+// steps (confirmed from M5GFX source), so a smooth percentage would
+// imply precision that doesn't physically exist. Adjusting these is the
+// next piece of work, not this one.
+void drawSettingsBrightnessPage() {
+  drawSettingsHeader("Settings");
+  drawSettingsStepperRow(46, "DAY BRIGHTNESS", String(DAY_BRIGHTNESS));
+  drawSettingsStepperRow(46 + SETTINGS_ROW_STEPPER_H, "NIGHT BRIGHTNESS", String(NIGHT_BRIGHTNESS));
+  drawSettingsNavBar();
+}
+
+// -- Page 4: Night Schedule (start/end) --
+// Same story: shows the real current schedule, read-only for now.
+void drawSettingsSchedulePage() {
+  drawSettingsHeader("Settings");
+  drawSettingsStepperRow(46, "NIGHT START",
+                         formatHourMinute12(NIGHT_START_HOUR, NIGHT_START_MINUTE));
+  drawSettingsStepperRow(46 + SETTINGS_ROW_STEPPER_H, "NIGHT END",
+                         formatHourMinute12(NIGHT_END_HOUR, NIGHT_END_MINUTE));
+  drawSettingsNavBar();
+}
+
+void drawSettingsPage() {
+  switch (settingsSubPage) {
+    case 0: drawSettingsVolumePage(); break;
+    case 1: drawSettingsMutePage(); break;
+    case 2: drawSettingsBrightnessPage(); break;
+    default: drawSettingsSchedulePage(); break;
+  }
+}
+
+// Settings-specific touch handling. Called instead of the generic
+// tap-to-advance logic whenever currentPage == PAGE_SETTINGS -- nearly
+// the whole screen is real controls here, so "tap anywhere advances"
+// would constantly collide with them. Nav-bar taps always redraw
+// (something visibly changed); content-area taps outside the nav bar
+// are matched against each page's known hotspots and logged, since
+// nothing on those pages is wired to a real value yet.
+void handleSettingsTouch(int x, int y) {
+  if (y >= SETTINGS_NAV_Y) {
+    if (x < SETTINGS_NAV_PREV_X1) {
+      settingsSubPage = (settingsSubPage + SETTINGS_NUM_SUBPAGES - 1) % SETTINGS_NUM_SUBPAGES;
+      Serial.printf("[settings] prev -> subpage %d\n", settingsSubPage);
+    } else if (x < SETTINGS_NAV_DONE_X1) {
+      Serial.println("[settings] DONE -- returning to Now");
+      currentPage = PAGE_NOW;
+      renderPage(currentPage);
+      return;
+    } else {
+      settingsSubPage = (settingsSubPage + 1) % SETTINGS_NUM_SUBPAGES;
+      Serial.printf("[settings] next -> subpage %d\n", settingsSubPage);
+    }
+    renderPage(currentPage);
+    return;
+  }
+
+  // Content-area tap. Brightness (subpage 2) and Night Schedule
+  // (subpage 3) are wired to the real values from the night-dimming
+  // feature; Volume and Mute (subpages 0-1) have nothing real to
+  // control until audio exists, so taps there just log.
+  //
+  // Stepper box geometry matches drawSettingsStepperRow() exactly
+  // (minus box x=16..52, plus box x=268..304, box height 30 starting
+  // 8px below the row's y) -- shared numbers, not independently
+  // guessed, so drawing and hit-testing can't drift apart.
+  const int ROW0_Y = 46, ROW1_Y = 46 + SETTINGS_ROW_STEPPER_H;
+  bool inMinusX = (x >= 16 && x < 52);
+  bool inPlusX = (x >= 268 && x < 304);
+  bool inRow0Y = (y >= ROW0_Y + 8 && y < ROW0_Y + 38);
+  bool inRow1Y = (y >= ROW1_Y + 8 && y < ROW1_Y + 38);
+  int direction = inMinusX ? -1 : (inPlusX ? 1 : 0);
+
+  if (direction != 0 && settingsSubPage == 2) {
+    if (inRow0Y) {
+      DAY_BRIGHTNESS = stepBrightness(DAY_BRIGHTNESS, direction);
+      Serial.printf("[settings] DAY_BRIGHTNESS -> %d\n", DAY_BRIGHTNESS);
+    } else if (inRow1Y) {
+      NIGHT_BRIGHTNESS = stepBrightness(NIGHT_BRIGHTNESS, direction);
+      Serial.printf("[settings] NIGHT_BRIGHTNESS -> %d\n", NIGHT_BRIGHTNESS);
+    } else {
+      return;  // tap was in the stepper's x-range but not its y-range
+    }
+    applyCurrentBrightnessImmediately();
+    renderPage(currentPage);
+    return;
+  }
+
+  if (direction != 0 && settingsSubPage == 3) {
+    if (inRow0Y) {
+      stepScheduleTime(NIGHT_START_HOUR, NIGHT_START_MINUTE, direction);
+      Serial.printf("[settings] NIGHT_START -> %02d:%02d\n", NIGHT_START_HOUR, NIGHT_START_MINUTE);
+    } else if (inRow1Y) {
+      stepScheduleTime(NIGHT_END_HOUR, NIGHT_END_MINUTE, direction);
+      Serial.printf("[settings] NIGHT_END -> %02d:%02d\n", NIGHT_END_HOUR, NIGHT_END_MINUTE);
+    } else {
+      return;
+    }
+    renderPage(currentPage);
+    return;
+  }
+
+  // Volume (0) and Mute (1): nothing real to wire yet. Logged so
+  // testing can still confirm hit-testing works.
+  Serial.printf("[settings] content tap at (%d,%d) on subpage %d -- not yet wired\n",
+                x, y, settingsSubPage);
 }
 
 void renderPageInner(Page p) {
@@ -1287,16 +1550,85 @@ void renderPage(Page p) {
 // real raw 0-255 inputs, not a pretend smooth percentage, because that
 // precision doesn't physically exist on this hardware.
 //
-// PLACEHOLDERS, pending Dan's real-hardware confirmation of what these
-// actually look like: NIGHT_BRIGHTNESS is the lowest real nonzero step;
-// the schedule matches the original planning brief's illustrative
-// 22:00-07:00 example. All four become Settings-configurable later.
-const uint8_t DAY_BRIGHTNESS = 255;
-const uint8_t NIGHT_BRIGHTNESS = 20;
-const int NIGHT_START_HOUR = 22;
-const int NIGHT_START_MINUTE = 0;
-const int NIGHT_END_HOUR = 7;
-const int NIGHT_END_MINUTE = 0;
+// Defaults, confirmed reasonable on real hardware for NIGHT_BRIGHTNESS
+// (Session 10); the schedule matches the original planning brief's
+// illustrative 22:00-07:00 example. All four are now adjustable from
+// the Settings page (Session 10) -- in memory only for now, no flash
+// persistence yet, so they reset to these defaults on every reboot.
+uint8_t DAY_BRIGHTNESS = 255;
+uint8_t NIGHT_BRIGHTNESS = 20;
+int NIGHT_START_HOUR = 22;
+int NIGHT_START_MINUTE = 0;
+int NIGHT_END_HOUR = 7;
+int NIGHT_END_MINUTE = 0;
+
+// The 9 real distinguishable brightness levels on this hardware
+// (Session 10 finding, derived from M5GFX's own (b+641)>>5 formula for
+// the CoreS3's brightness-to-DLDO1-voltage mapping). The Settings
+// brightness stepper moves between these 9 levels one at a time, not by
+// an arbitrary raw-unit increment that might land inside the same
+// physical step and visibly do nothing.
+const uint8_t BRIGHTNESS_LEVELS[9] = {1, 31, 63, 95, 127, 159, 191, 223, 255};
+const int BRIGHTNESS_LEVEL_COUNT = 9;
+
+// Finds the closest entry in BRIGHTNESS_LEVELS to an arbitrary raw value
+// (so a value that doesn't exactly match a level, e.g. an old default,
+// still has a sensible "current" index to step from).
+int nearestBrightnessLevelIndex(uint8_t raw) {
+  int best = 0;
+  int bestDiff = 256;
+  for (int i = 0; i < BRIGHTNESS_LEVEL_COUNT; i++) {
+    int diff = (int)raw - (int)BRIGHTNESS_LEVELS[i];
+    if (diff < 0) diff = -diff;  // inlined, not abs() -- Arduino's abs() is a
+                                 // macro with known double-evaluation pitfalls
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = i;
+    }
+  }
+  return best;
+}
+
+// Steps a brightness value by one real level in the given direction
+// (+1 or -1), clamped at the ends (does not wrap -- reaching max
+// brightness and tapping + again should just stay at max, unlike the
+// Settings page navigation, which wraps deliberately for a different
+// reason).
+uint8_t stepBrightness(uint8_t current, int direction) {
+  int idx = nearestBrightnessLevelIndex(current) + direction;
+  if (idx < 0) idx = 0;
+  if (idx >= BRIGHTNESS_LEVEL_COUNT) idx = BRIGHTNESS_LEVEL_COUNT - 1;
+  return BRIGHTNESS_LEVELS[idx];
+}
+
+// Steps a schedule time by 15 minutes (placeholder increment -- not yet
+// decided with Dan) in the given direction, wrapping across midnight
+// (23:50 + 15 min -> 00:05), since a time-of-day naturally wraps within
+// a day, unlike brightness.
+void stepScheduleTime(int &hour, int &minute, int direction) {
+  int total = hour * 60 + minute;
+  total += direction * 15;
+  total = ((total % 1440) + 1440) % 1440;  // wraparound-safe for either direction
+  hour = total / 60;
+  minute = total % 60;
+}
+
+// If the brightness value for the CURRENTLY ACTIVE mode (day or night)
+// was just changed in Settings, apply it to the hardware immediately --
+// otherwise the change wouldn't be visible until the next day/night
+// transition, which could be hours away. Adjusting the INACTIVE mode's
+// value (e.g. changing night brightness while it's currently day) is a
+// silent no-op here by design: it takes effect next time that mode
+// starts, which handleNightDimming() already does on its own.
+void applyCurrentBrightnessImmediately() {
+  if (lastAppliedBrightnessMode == 1) {
+    M5.Display.setBrightness(NIGHT_BRIGHTNESS);
+  } else if (lastAppliedBrightnessMode == 0) {
+    M5.Display.setBrightness(DAY_BRIGHTNESS);
+  }
+  // mode == -1 (not yet established) is left alone; handleNightDimming()
+  // will set a real value on its very next pass regardless.
+}
 
 // -1 = not yet applied (forces the very first loop() pass to set a real
 // brightness rather than silently trusting whatever M5.begin()'s own
@@ -1806,6 +2138,7 @@ void loop() {
     lastActivityTime = millis();
     if (currentPage != PAGE_SETTINGS) {
       currentPage = PAGE_SETTINGS;
+      settingsSubPage = 0;  // always start on Volume + Test Tone
       Serial.println("Long-press detected -- opening Settings");
       renderPage(currentPage);
     }
@@ -1846,12 +2179,10 @@ void loop() {
       currentPage = PAGE_NWS_ALERTS;
       Serial.println("Tap on Now alert footer -- jumping to NWS Alerts");
       renderPage(currentPage);
+    } else if (currentPage == PAGE_SETTINGS) {
+      handleSettingsTouch((int)touch.x, (int)touch.y);
     } else {
-      if (currentPage == PAGE_SETTINGS) {
-        currentPage = PAGE_NOW;
-      } else {
-        currentPage = (Page)((currentPage + 1) % NUM_CYCLE_PAGES);
-      }
+      currentPage = (Page)((currentPage + 1) % NUM_CYCLE_PAGES);
       Serial.printf("Tap -- now on page %d\n", (int)currentPage);
       renderPage(currentPage);
     }
