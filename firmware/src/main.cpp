@@ -239,7 +239,13 @@ static uint16_t COLOR_BG, COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY, COLOR_TEXT_D
     // to read as a distinct, graduated step -- replaced with a real
     // orange after a side-by-side render caught it. "Plain" (50-79F) is
     // just COLOR_TEXT_SECONDARY, unchanged -- no new constant needed.
-    COLOR_FEELS_COLD, COLOR_FEELS_COOL, COLOR_FEELS_ORANGE;
+    COLOR_FEELS_COLD, COLOR_FEELS_COOL, COLOR_FEELS_ORANGE,
+    // Simulation-mode overlay. Deliberately a hue used nowhere else in
+    // the palette (not red/amber/green), so it can never be confused
+    // with a real alert color -- chosen on the server-driven design
+    // that the device needs almost no simulation-specific rendering,
+    // just this one unmistakable overlay.
+    COLOR_SIMULATION;
 
 void initColors() {
   COLOR_BG               = M5.Display.color565(0x04, 0x04, 0x04);
@@ -260,6 +266,7 @@ void initColors() {
   COLOR_FEELS_COLD        = M5.Display.color565(0x5a, 0x9a, 0xe0);
   COLOR_FEELS_COOL        = M5.Display.color565(0x8a, 0xc8, 0xe0);
   COLOR_FEELS_ORANGE      = M5.Display.color565(0xe0, 0x7a, 0x1a);
+  COLOR_SIMULATION        = M5.Display.color565(0xc0, 0x4e, 0xe0);
 }
 
 // ---- Now screen ----
@@ -470,6 +477,16 @@ int fitTextSize(const char *text, int maxWidth) {
 // snap to the correct band, not eased in -- there's nothing to flicker
 // against yet).
 int lastFeelsLikeBand = -1;
+
+// Simulation / test mode (v1.0 requirement, server-driven -- see the
+// server's own comment block for the full design). The device does
+// almost nothing special: it reads one flag and draws one unmistakable
+// overlay on top of whatever the page would show anyway. Approved
+// treatment (Session 10 mockup): a magenta border framing the full
+// screen plus a small corner tag, drawn as a pure overlay AFTER the
+// page's own content so it can never disturb any page's existing
+// layout math.
+bool simulationActive = false;
 
 void drawNowPage() {
   // Real clock now comes from NTP sync (syncTimeNTP(), called once at
@@ -1218,9 +1235,39 @@ void renderPageInner(Page p) {
 const unsigned long DIAG_SLOW_RENDER_MS = 100;
 const unsigned long DIAG_LOOP_GAP_MS = 250;
 
+// Drawn AFTER a page's own content, on every page including Settings,
+// regardless of which screen is showing -- a pure overlay that never
+// reads or depends on that page's own layout, so it carries zero risk
+// of colliding with any page's carefully-tuned coordinates. A thin
+// border frames the whole screen (visible continuously, not just a
+// glance-and-miss detail) plus a small corner tag naming it explicitly.
+void drawSimulationOverlay() {
+  const int BORDER_W = 4;
+  for (int i = 0; i < BORDER_W; i++) {
+    M5.Display.drawRect(i, i, 320 - 2 * i, 240 - 2 * i, COLOR_SIMULATION);
+  }
+  // Corner tag geometry was checked against every page's real header, not
+  // guessed: every secondary page's title starts at y=10 (drawSecondaryHeader,
+  // size 3), so an 8px-tall tag (matching Font0's exact 6x8 size, confirmed
+  // from M5GFX source) at y=0..7 leaves a real 2px gap before it -- not a
+  // 1px razor's edge. Width 68px comfortably covers "SIMULATION" (10 chars
+  // x 6px = 60px) with a few px of padding; the Now screen's own top-right
+  // content (age text, Wi-Fi glyph) lives at x>=266, far clear of this
+  // corner. Checked against an exact-pixel render of the worst case
+  // (longest title, "Wind & Rain") before trusting this, not just by eye.
+  M5.Display.fillRect(0, 0, 68, 8, COLOR_SIMULATION);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(COLOR_BG, COLOR_SIMULATION);
+  M5.Display.setTextSize(1);
+  M5.Display.drawString("SIMULATION", 4, 0);
+}
+
 void renderPage(Page p) {
   unsigned long t0 = millis();
   renderPageInner(p);
+  if (simulationActive) {
+    drawSimulationOverlay();
+  }
   unsigned long dt = millis() - t0;
   if (dt > DIAG_SLOW_RENDER_MS) {
     Serial.printf("[diag] slow render: page %d took %lu ms\n", (int)p, dt);
@@ -1549,6 +1596,17 @@ void fetchConditions() {
     }
     tempestPressureInHg = doc["tempest"]["pressure_inhg_station"];
     tempestWindDir = doc["tempest"]["wind_direction"].as<String>();
+  }
+
+  // Top-level flag, present on every real response too (as false) --
+  // simulation is decided entirely server-side; the device only ever
+  // reflects it.
+  simulationActive = doc["simulation"] | false;
+  if (simulationActive) {
+    const char *scenario = doc["simulation_scenario"] | "?";
+    int step = doc["simulation_step"] | -1;
+    const char *desc = doc["simulation_step_description"] | "";
+    Serial.printf("[fetch] SIMULATION active: scenario=%s step=%d (%s)\n", scenario, step, desc);
   }
 
   lightningActive = doc["lightning"]["active"];

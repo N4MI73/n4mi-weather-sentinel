@@ -478,6 +478,225 @@ def classify_level(props):
 # separate, deliberately deferred work (see project brief).
 tracked_alerts = {}
 
+# --- Simulation / test mode (v1.0 requirement) ---
+#
+# The server, not the firmware, owns simulation: it serves synthetic data
+# through the EXACT same /api/conditions shape real data uses, marked with
+# "simulation": true. Firmware needs almost no new code -- it already
+# renders whatever this endpoint sends; it just also draws an unmistakable
+# overlay when the flag is set. This also means the real UDP listener and
+# NWS poller keep running normally in the background the whole time
+# (see the safety check in api_conditions below) -- simulation never
+# suspends real monitoring, only overrides what's SERVED while nothing
+# real needs attention.
+#
+# Trigger: POST /api/simulation/start {"scenario": "..."}, then either
+# POST /api/simulation/advance (manual) or a real device acknowledgement
+# (for steps with advance_on_ack=True) to move through it, and
+# POST /api/simulation/stop to resume real data. GET /api/simulation/status
+# reports the current state for convenience when driving this by hand.
+
+SIMULATION_ALERT_ID = "urn:sim:test-alert"
+
+SIMULATION_BASE_TEMPEST = {
+    "available": True,
+    "observation_age_sec": 5,
+    "observed_at": None,  # filled in per-request
+    "temperature_f": 78.0,
+    "feels_like_f": 78.0,
+    "humidity_percent": 55,
+    "wind_mph": 3.0,
+    "gust_mph": 6.0,
+    "wind_direction": "NW",
+    "pressure_inhg_station": 29.90,
+    "rain_this_interval_in": 0.0,
+    "rain_rate_in_hr": 0.0,
+    "rain_rate_level": "none",
+}
+
+SIMULATION_BASE_LIGHTNING = {
+    "active": False,
+    "level": "none",
+    "closest_distance_mi": None,
+    "most_recent_strike_at": None,
+    "most_recent_strike_epoch": None,
+    "strike_count_recent": 0,
+    "window_minutes": None,   # filled in per-request from the real setting
+    "filter_radius_mi": None,  # filled in per-request from the real setting
+}
+
+
+def _sim_alert(event, level, hazard, what, instruction, acknowledged, needs_alert, last_transition):
+    """Builds one simulated alert dict in the exact shape real alerts use
+    (see process_nws_alerts_locked / api_conditions's alerts_copy), so
+    firmware parses it identically either way. expires/first_seen_at/
+    last_updated_at are placeholders here -- build_simulated_conditions()
+    recomputes expires fresh on every request, since a step may sit on
+    screen for a long time while it's being examined."""
+    return {
+        "id": SIMULATION_ALERT_ID,
+        "event": event,
+        "severity": "Extreme" if level == "critical" else "Severe",
+        "urgency": "Immediate",
+        "certainty": "Observed",
+        "onset": None,
+        "expires": None,
+        "headline": what,
+        "instruction": instruction,
+        "what": what,
+        "hazard": hazard,
+        "level": level,
+        "acknowledged": acknowledged,
+        "last_transition": last_transition,
+        "needs_alert": needs_alert,
+        "first_seen_at": None,
+        "last_updated_at": None,
+    }
+
+
+# The escalated step deliberately uses a long, realistic instruction (the
+# kind layout "B" was built to handle) so this scenario doubles as a
+# stress test of long-text wrapping, not just the lifecycle transitions.
+_SIM_LONG_INSTRUCTION = (
+    "TAKE COVER NOW! Move to a basement or an interior room on the lowest "
+    "floor of a sturdy building. Avoid windows. If you are outdoors, in a "
+    "mobile home, or in a vehicle, move to the closest substantial shelter "
+    "and protect yourself from flying debris. Torrential rainfall is also "
+    "occurring with these storms and may lead to flash flooding."
+)
+
+NWS_LIFECYCLE_STEPS = [
+    {
+        "description": "New alert, awaiting acknowledgement",
+        "alerts": [_sim_alert(
+            "Special Weather Statement", "informational",
+            "Wind gusts up to 50 mph.",
+            "A strong thunderstorm will impact the simulated area.",
+            "If outdoors, consider seeking shelter inside a building.",
+            acknowledged=False, needs_alert=True, last_transition="new")],
+        "advance_on_ack": True,
+    },
+    {
+        "description": "Acknowledged; non-escalating update (ack preserved)",
+        "alerts": [_sim_alert(
+            "Special Weather Statement", "informational",
+            "Wind gusts up to 60 mph.",
+            "A strong thunderstorm continues to impact the simulated area.",
+            "If outdoors, consider seeking shelter inside a building.",
+            acknowledged=True, needs_alert=False, last_transition="updated")],
+        "advance_on_ack": False,
+    },
+    {
+        "description": "Escalated to Tornado Warning (acknowledgement cleared)",
+        "alerts": [_sim_alert(
+            "Tornado Warning", "critical",
+            "Damaging tornado.",
+            "A confirmed tornado was located over the simulated area, moving northeast at 30 mph.",
+            _SIM_LONG_INSTRUCTION,
+            acknowledged=False, needs_alert=True, last_transition="escalated")],
+        "advance_on_ack": True,
+    },
+    {
+        "description": "Escalated alert acknowledged",
+        "alerts": [_sim_alert(
+            "Tornado Warning", "critical",
+            "Damaging tornado.",
+            "A confirmed tornado was located over the simulated area, moving northeast at 30 mph.",
+            _SIM_LONG_INSTRUCTION,
+            acknowledged=True, needs_alert=False, last_transition="unchanged")],
+        "advance_on_ack": False,
+    },
+    {
+        "description": "Alert expired -- back to no active alerts",
+        "alerts": [],
+        "advance_on_ack": False,
+    },
+]
+
+LIGHTNING_SCENARIO_STEPS = [
+    {
+        "description": "Clear",
+        "lightning": {"active": False, "level": "none", "closest_distance_mi": None,
+                      "most_recent_strike_at": None, "most_recent_strike_epoch": None,
+                      "strike_count_recent": 0},
+        "alerts": [],
+        "advance_on_ack": False,
+    },
+    {
+        "description": "Sporadic (1 strike, 5.2 mi)",
+        "lightning": {"active": True, "level": "sporadic",
+                      "closest_distance_mi": 5.2, "strike_count_recent": 1},
+        "alerts": [],
+        "advance_on_ack": False,
+    },
+    {
+        "description": "Frequent (4 strikes, 3.5 mi)",
+        "lightning": {"active": True, "level": "frequent",
+                      "closest_distance_mi": 3.5, "strike_count_recent": 4},
+        "alerts": [],
+        "advance_on_ack": False,
+    },
+    {
+        "description": "Aged out of the window -- reverts to clear",
+        "lightning": {"active": False, "level": "none", "closest_distance_mi": None,
+                      "most_recent_strike_at": None, "most_recent_strike_epoch": None,
+                      "strike_count_recent": 0},
+        "alerts": [],
+        "advance_on_ack": False,
+    },
+]
+
+SIMULATION_SCENARIOS = {
+    "nws_lifecycle": NWS_LIFECYCLE_STEPS,
+    "lightning": LIGHTNING_SCENARIO_STEPS,
+}
+
+# Guarded by state_lock, same as every other piece of shared state.
+simulation_state = {"active": False, "scenario": None, "step": 0}
+
+
+def build_simulated_conditions(scenario_name, step_index):
+    """Builds a complete /api/conditions response from a simulation step,
+    in the identical shape real responses use. Timestamps are computed
+    fresh on every call (not fixed at scenario-start), since a step may
+    stay on screen for a long time while it's being examined -- the
+    device's own freshness rules must see this as current, not stale."""
+    scenario = SIMULATION_SCENARIOS[scenario_name]
+    step = scenario[step_index]
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+
+    tempest = dict(SIMULATION_BASE_TEMPEST)
+    tempest["observed_at"] = now_iso
+
+    lightning = dict(SIMULATION_BASE_LIGHTNING)
+    lightning["window_minutes"] = LIGHTNING_WINDOW_MINUTES
+    lightning["filter_radius_mi"] = LIGHTNING_FILTER_RADIUS_MI
+    lightning.update(step.get("lightning", {}))
+    if lightning["active"] and lightning.get("most_recent_strike_epoch") is None:
+        now_epoch = int(time.time())
+        lightning["most_recent_strike_epoch"] = now_epoch
+        lightning["most_recent_strike_at"] = iso_time(now_epoch)
+
+    alerts = []
+    for template in step.get("alerts", []):
+        alert = dict(template)
+        alert["expires"] = (now + timedelta(minutes=45)).isoformat()
+        alert["first_seen_at"] = now_iso
+        alert["last_updated_at"] = now_iso
+        alerts.append(alert)
+
+    return {
+        "tempest": tempest,
+        "lightning": lightning,
+        "nws": {"available": True, "last_polled_at": now_iso, "alerts": alerts},
+        "simulation": True,
+        "simulation_scenario": scenario_name,
+        "simulation_step": step_index,
+        "simulation_step_description": step.get("description", ""),
+    }
+
+
 ALERT_EXPIRY_CLEANUP_MINUTES = 30  # how long an expired alert stays
                                      # visible internally before being
                                      # dropped, bounding memory growth
@@ -718,6 +937,26 @@ def api_conditions():
             if alert["last_transition"] != "expired"
         ]
 
+        # Simulation must NEVER mask a real active alert. The real UDP
+        # listener and NWS poller keep running the whole time simulation
+        # is active (nothing above is suspended) -- so if a genuine NWS
+        # alert has become active while a test happens to be running,
+        # exit simulation immediately and fall through to serving real
+        # data below, logging loudly that it happened.
+        if simulation_state["active"] and alerts_copy:
+            print(f"[simulation] REAL alert now active ({alerts_copy[0]['event']}) "
+                  f"-- auto-stopping simulation, serving real data", flush=True)
+            simulation_state["active"] = False
+            simulation_state["scenario"] = None
+            simulation_state["step"] = 0
+
+        sim_active = simulation_state["active"]
+        sim_scenario = simulation_state["scenario"]
+        sim_step = simulation_state["step"]
+
+    if sim_active:
+        return jsonify(build_simulated_conditions(sim_scenario, sim_step))
+
     # Called OUTSIDE the block above, deliberately -- get_lightning_status()
     # acquires state_lock itself, and this lock is a plain threading.Lock
     # (not reentrant), so calling it while still holding the lock above
@@ -742,6 +981,7 @@ def api_conditions():
             "last_polled_at": nws_last_polled,
             "alerts": alerts_copy,
         },
+        "simulation": False,
     })
 
 
@@ -753,12 +993,102 @@ def api_ack_alert():
         return jsonify({"error": "missing 'id' in request body"}), 400
 
     with state_lock:
+        if simulation_state["active"]:
+            # A real device tap during a simulation exercises the SAME ack
+            # code path a real alert would -- this is deliberately not a
+            # separate, fake acknowledgement mechanism.
+            scenario = SIMULATION_SCENARIOS[simulation_state["scenario"]]
+            step = scenario[simulation_state["step"]]
+            step_alerts = step.get("alerts", [])
+            if not step_alerts or step_alerts[0]["id"] != alert_id:
+                return jsonify({"error": "unknown alert id"}), 404
+            if step.get("advance_on_ack") and simulation_state["step"] + 1 < len(scenario):
+                simulation_state["step"] += 1
+                next_step = scenario[simulation_state["step"]]
+                print(f"[simulation] ack received -- auto-advancing to step "
+                      f"{simulation_state['step']} ({next_step.get('description', '')})", flush=True)
+            return jsonify({"status": "ok", "id": alert_id})
+
+        # --- real path, unchanged ---
         if alert_id not in tracked_alerts:
             return jsonify({"error": "unknown alert id"}), 404
         tracked_alerts[alert_id]["acknowledged"] = True
         save_persisted_alerts_locked()
 
     return jsonify({"status": "ok", "id": alert_id})
+
+
+@app.route("/api/simulation/start", methods=["POST"])
+def api_simulation_start():
+    data = request.get_json(silent=True) or {}
+    scenario_name = data.get("scenario")
+    if scenario_name not in SIMULATION_SCENARIOS:
+        return jsonify({
+            "error": f"unknown scenario {scenario_name!r}",
+            "available_scenarios": list(SIMULATION_SCENARIOS.keys()),
+        }), 400
+
+    with state_lock:
+        simulation_state["active"] = True
+        simulation_state["scenario"] = scenario_name
+        simulation_state["step"] = 0
+
+    print(f"[simulation] STARTED scenario '{scenario_name}'", flush=True)
+    return jsonify({
+        "status": "ok", "scenario": scenario_name, "step": 0,
+        "description": SIMULATION_SCENARIOS[scenario_name][0].get("description", ""),
+    })
+
+
+@app.route("/api/simulation/advance", methods=["POST"])
+def api_simulation_advance():
+    with state_lock:
+        if not simulation_state["active"]:
+            return jsonify({"error": "no simulation is currently active"}), 400
+        scenario = SIMULATION_SCENARIOS[simulation_state["scenario"]]
+        if simulation_state["step"] + 1 >= len(scenario):
+            return jsonify({
+                "error": "already at the final step of this scenario",
+                "step": simulation_state["step"],
+            }), 400
+        simulation_state["step"] += 1
+        step = scenario[simulation_state["step"]]
+
+    print(f"[simulation] manually advanced to step {simulation_state['step']} "
+          f"({step.get('description', '')})", flush=True)
+    return jsonify({"status": "ok", "step": simulation_state["step"],
+                    "description": step.get("description", "")})
+
+
+@app.route("/api/simulation/stop", methods=["POST"])
+def api_simulation_stop():
+    with state_lock:
+        was_active = simulation_state["active"]
+        simulation_state["active"] = False
+        simulation_state["scenario"] = None
+        simulation_state["step"] = 0
+
+    print("[simulation] STOPPED" if was_active
+          else "[simulation] stop requested but nothing was active", flush=True)
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/simulation/status")
+def api_simulation_status():
+    with state_lock:
+        snap = dict(simulation_state)
+
+    if not snap["active"]:
+        return jsonify({"active": False, "available_scenarios": list(SIMULATION_SCENARIOS.keys())})
+
+    scenario = SIMULATION_SCENARIOS[snap["scenario"]]
+    return jsonify({
+        "active": True,
+        "scenario": snap["scenario"],
+        "step": snap["step"],
+        "total_steps": len(scenario),
+        "description": scenario[snap["step"]].get("description", ""),
+    })
 
 
 @app.route("/healthz")
