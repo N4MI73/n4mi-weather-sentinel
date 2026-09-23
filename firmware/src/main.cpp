@@ -1274,6 +1274,68 @@ void renderPage(Page p) {
   }
 }
 
+// ---- Night dimming (v1.0 requirement) ----
+//
+// Real hardware quirk confirmed from M5GFX's own source (Session 10),
+// not assumed: setBrightness() takes 0-255, but the CoreS3's brightness-
+// to-DLDO1-voltage formula ((b+641)>>5) collapses that whole range into
+// only 9 real distinguishable physical steps -- inputs 1-29 all produce
+// the SAME dimmest nonzero level, 223-255 all produce the SAME brightest.
+// setBrightness(0) is NOT "very dim" -- it disables the backlight rail
+// entirely (screen goes fully black), which is not what night mode wants
+// (dim but still glanceable in a dark room). The constants below are
+// real raw 0-255 inputs, not a pretend smooth percentage, because that
+// precision doesn't physically exist on this hardware.
+//
+// PLACEHOLDERS, pending Dan's real-hardware confirmation of what these
+// actually look like: NIGHT_BRIGHTNESS is the lowest real nonzero step;
+// the schedule matches the original planning brief's illustrative
+// 22:00-07:00 example. All four become Settings-configurable later.
+const uint8_t DAY_BRIGHTNESS = 255;
+const uint8_t NIGHT_BRIGHTNESS = 20;
+const int NIGHT_START_HOUR = 22;
+const int NIGHT_START_MINUTE = 0;
+const int NIGHT_END_HOUR = 7;
+const int NIGHT_END_MINUTE = 0;
+
+// -1 = not yet applied (forces the very first loop() pass to set a real
+// brightness rather than silently trusting whatever M5.begin()'s own
+// default happened to be); 0 = day applied; 1 = night applied.
+int lastAppliedBrightnessMode = -1;
+
+// If the clock isn't synced, we genuinely don't know whether it's night
+// -- default to DAY (bright) in that case. Failing toward more visible
+// is the safer direction for a device whose whole job is to be seen;
+// failing toward dim is not.
+bool isNightTimeNow() {
+  if (!timeSynced) return false;
+  time_t now = time(nullptr);
+  struct tm t;
+  localtime_r(&now, &t);
+  int nowMinutes = t.tm_hour * 60 + t.tm_min;
+  int startMinutes = NIGHT_START_HOUR * 60 + NIGHT_START_MINUTE;
+  int endMinutes = NIGHT_END_HOUR * 60 + NIGHT_END_MINUTE;
+  if (startMinutes == endMinutes) return false;  // degenerate schedule: treat as always-day
+  if (startMinutes < endMinutes) {
+    return nowMinutes >= startMinutes && nowMinutes < endMinutes;
+  }
+  // Schedule wraps past midnight (e.g. 22:00 -> 07:00).
+  return nowMinutes >= startMinutes || nowMinutes < endMinutes;
+}
+
+// Called every loop() pass but only writes to the display hardware when
+// the day/night mode actually changes -- an I2C write on every ~10ms
+// loop iteration would be pointless and wasteful when nothing changed.
+void handleNightDimming() {
+  bool night = isNightTimeNow();
+  int mode = night ? 1 : 0;
+  if (mode == lastAppliedBrightnessMode) return;
+  uint8_t level = night ? NIGHT_BRIGHTNESS : DAY_BRIGHTNESS;
+  M5.Display.setBrightness(level);
+  Serial.printf("[brightness] switched to %s (raw %d)\n", night ? "NIGHT" : "DAY", level);
+  lastAppliedBrightnessMode = mode;
+}
+
 // Phase 2a: Wi-Fi connectivity only -- no HTTP fetch, no screen changes
 // yet. Uses the wifi_credentials.h stopgap (real captive portal comes
 // later, per project instructions). Success/failure reported to serial
@@ -1798,6 +1860,7 @@ void loop() {
   // Wi-Fi/NTP reconnect -- non-blocking, runs every pass regardless of
   // which page is showing (v1.0 requirement, §24).
   handleWifiAndNtpReconnect();
+  handleNightDimming();
 
   // Idle auto-return to Now
   if (currentPage != PAGE_NOW &&
