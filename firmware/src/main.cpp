@@ -39,6 +39,18 @@ uint8_t stepBrightness(uint8_t current, int direction);
 void stepScheduleTime(int &hour, int &minute, int direction);
 void applyCurrentBrightnessImmediately();
 
+// Audio (Session 11): same forward-declaration need, same reason.
+extern uint8_t alarmVolume;
+extern bool audioMuted;
+extern unsigned long muteUntilMillis;
+void applyAlarmVolumeImmediately();
+void toggleMute();
+void playTestTone();
+void startRunTestAlertScenario();
+String formatMuteUntil();
+bool isNightTimeNow();
+extern const int ALARM_VOLUME_STEP;
+
 enum Page {
   PAGE_NOW = 0,
   PAGE_WIND_RAIN,
@@ -91,6 +103,10 @@ String nwsFirstAlertWhat = "";     // NWS's one-line headline, minus its time ph
 String nwsFirstAlertHazard = "";   // the "HAZARD..." / "WHAT..." line
 bool nwsFirstAlertAcknowledged = false;
 bool nwsFirstAlertNeedsAlert = false;
+// "critical"/"warning"/"watch"/"advisory"/"informational" -- the server
+// has classified and sent this since Session 5; firmware only starts
+// reading it now, for the alarm engine (Session 11).
+String nwsFirstAlertLevel = "";
 
 bool hasEverFetchedSuccessfully = false;
 bool timeSynced = false;  // set by syncTimeNTP(), defined near connectWiFi()
@@ -1228,6 +1244,13 @@ const int SETTINGS_NAV_DONE_X0 = 64, SETTINGS_NAV_DONE_X1 = 256;
 const int SETTINGS_NAV_NEXT_X0 = 256, SETTINGS_NAV_NEXT_X1 = 320;
 
 const int SETTINGS_ROW_STEPPER_H = 64;  // stepper row height + gap, matches the approved mockup
+// Real bug found on hardware (Session 10) and fixed here (Session 11):
+// the label and its stepper box had zero gap between them (box started
+// at y+8, right where the size-1 label's own text ends), reading as
+// visually crowded. Pulled into one named constant, shared between the
+// drawing code and the touch hit-test below, so they can't drift apart
+// the way two independently-hardcoded "8"s could have.
+const int SETTINGS_STEPPER_BOX_Y_OFFSET = 12;
 const int SETTINGS_ROW_BUTTON_H = 58;   // button row height + gap
 const int SETTINGS_LABEL_ONLY_H = 18;   // a bare label line + gap
 
@@ -1261,7 +1284,7 @@ void drawSettingsStepperRow(int y, const char *label, const String &value) {
   M5.Display.setTextSize(1);
   M5.Display.drawString(label, 16, y);
 
-  int boxY = y + 8;
+  int boxY = y + SETTINGS_STEPPER_BOX_Y_OFFSET;
   M5.Display.drawRoundRect(16, boxY, 36, 30, 4, COLOR_LIGHTNING_TEXT);
   M5.Display.drawRoundRect(268, boxY, 36, 30, 4, COLOR_LIGHTNING_TEXT);
   M5.Display.setTextDatum(middle_center);
@@ -1331,23 +1354,30 @@ String formatHourMinute12(int hour, int minute) {
 // control that silently does nothing without saying so.
 void drawSettingsVolumePage() {
   drawSettingsHeader("Settings");
-  drawSettingsStepperRow(46, "VOLUME", "--");
+  drawSettingsStepperRow(46, "VOLUME", String(alarmVolume));
   drawSettingsButtonRow(46 + SETTINGS_ROW_STEPPER_H, 34, "TEST TONE", COLOR_LIGHTNING_TEXT, false, "");
   drawSettingsNavBar();
 }
 
 // -- Page 2: Mute + Run Test Alert --
-// Same as above: Mute has nothing real to control until audio exists.
-// Run Test Alert is left inert for this same pass -- it's a natural
-// next step (it could call this device's own /api/simulation/start),
-// but that's a separate piece of wiring not yet built here.
+// Both wired for real (Session 11). Mute turns solid red and stays
+// labelled with its end time while active, per the project's "visibly
+// indicated" rule for mute -- this is only on the Settings page itself
+// for now; a matching indicator on every other screen (the brief's own
+// flagged gap) is not yet built.
 void drawSettingsMutePage() {
   drawSettingsHeader("Settings");
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextColor(COLOR_LABEL, COLOR_BG);
   M5.Display.setTextSize(1);
   M5.Display.drawString("MUTE", 16, 46);
-  drawSettingsButtonRow(46 + SETTINGS_LABEL_ONLY_H, 34, "OFF  (tap to mute)", COLOR_NWS_CLEAR_TEXT, false, "");
+  if (audioMuted) {
+    drawSettingsButtonRow(46 + SETTINGS_LABEL_ONLY_H, 34, "ON  (tap to cancel)",
+                          COLOR_STATUS_BAD, true, formatMuteUntil());
+  } else {
+    drawSettingsButtonRow(46 + SETTINGS_LABEL_ONLY_H, 34, "OFF  (tap to mute)",
+                          COLOR_NWS_CLEAR_TEXT, false, "");
+  }
   drawSettingsButtonRow(46 + SETTINGS_LABEL_ONLY_H + SETTINGS_ROW_BUTTON_H, 34,
                         "RUN TEST ALERT", COLOR_LIGHTNING_TEXT, false, "");
   drawSettingsNavBar();
@@ -1424,8 +1454,8 @@ void handleSettingsTouch(int x, int y) {
   const int ROW0_Y = 46, ROW1_Y = 46 + SETTINGS_ROW_STEPPER_H;
   bool inMinusX = (x >= 16 && x < 52);
   bool inPlusX = (x >= 268 && x < 304);
-  bool inRow0Y = (y >= ROW0_Y + 8 && y < ROW0_Y + 38);
-  bool inRow1Y = (y >= ROW1_Y + 8 && y < ROW1_Y + 38);
+  bool inRow0Y = (y >= ROW0_Y + SETTINGS_STEPPER_BOX_Y_OFFSET && y < ROW0_Y + SETTINGS_STEPPER_BOX_Y_OFFSET + 30);
+  bool inRow1Y = (y >= ROW1_Y + SETTINGS_STEPPER_BOX_Y_OFFSET && y < ROW1_Y + SETTINGS_STEPPER_BOX_Y_OFFSET + 30);
   int direction = inMinusX ? -1 : (inPlusX ? 1 : 0);
 
   if (direction != 0 && settingsSubPage == 2) {
@@ -1457,9 +1487,49 @@ void handleSettingsTouch(int x, int y) {
     return;
   }
 
-  // Volume (0) and Mute (1): nothing real to wire yet. Logged so
-  // testing can still confirm hit-testing works.
-  Serial.printf("[settings] content tap at (%d,%d) on subpage %d -- not yet wired\n",
+  // Volume (subpage 0): stepper adjusts alarmVolume directly (a flat
+  // increment, not a level table like brightness -- no hardware
+  // coarseness has been found here); TEST TONE button plays a real tone
+  // at the current volume. Box geometry matches drawSettingsButtonRow's
+  // call site exactly (y=46+64=110, h=34).
+  if (settingsSubPage == 0) {
+    if (direction != 0 && inRow0Y) {
+      int newVol = (int)alarmVolume + direction * ALARM_VOLUME_STEP;
+      if (newVol < 0) newVol = 0;
+      if (newVol > 255) newVol = 255;
+      alarmVolume = (uint8_t)newVol;
+      Serial.printf("[settings] alarmVolume -> %d\n", alarmVolume);
+      applyAlarmVolumeImmediately();
+      renderPage(currentPage);
+      return;
+    }
+    bool inTestToneButton = (x >= 16 && x < 304 && y >= 110 && y < 144);
+    if (inTestToneButton) {
+      playTestTone();
+      return;  // no redraw needed -- nothing on screen changes
+    }
+    return;
+  }
+
+  // Mute (subpage 1): toggle + Run Test Alert. Box geometry matches
+  // drawSettingsMutePage's actual call sites (y=64 and y=122, h=34 each).
+  if (settingsSubPage == 1) {
+    bool inMuteButton = (x >= 16 && x < 304 && y >= 64 && y < 98);
+    bool inRunTestAlertButton = (x >= 16 && x < 304 && y >= 122 && y < 156);
+    if (inMuteButton) {
+      toggleMute();
+      renderPage(currentPage);
+      return;
+    }
+    if (inRunTestAlertButton) {
+      startRunTestAlertScenario();
+      return;  // no redraw -- the new simulated data arrives on the next periodic fetch
+    }
+    return;
+  }
+
+  // Anything else in the content area on these two pages: no known hotspot.
+  Serial.printf("[settings] content tap at (%d,%d) on subpage %d -- no hotspot there\n",
                 x, y, settingsSubPage);
 }
 
@@ -1628,6 +1698,240 @@ void applyCurrentBrightnessImmediately() {
   }
   // mode == -1 (not yet established) is left alone; handleNightDimming()
   // will set a real value on its very next pass regardless.
+}
+
+// ---- Audio: alarm tones by alert level (v1.0 requirement) ----
+//
+// API confirmed from real M5Stack/M5Unified source before writing any of
+// this (Session 11): M5.Speaker.tone(freq, durationMs, channel,
+// stop_current_sound) is NON-BLOCKING -- it hands the tone to a
+// DMA-backed background task and returns immediately, so the whole
+// pattern below is driven by comparing millis() against scheduled times,
+// never by delay(), matching every other periodic subsystem in this
+// file (Wi-Fi reconnect, night dimming). isPlaying()/stop() exist per
+// real source but aren't needed here: tone()'s own duration parameter
+// already handles stopping each individual tone. A real GitHub issue
+// (m5stack/M5Unified #98) reports noisy output on this hardware below
+// 1kHz, so every alarm tone here stays comfortably above that.
+const int ALERT_TONE_CHANNEL = 0;  // dedicated channel; never shared with Test Tone's own playback
+
+// Placeholder pattern parameters -- frequencies, durations and the
+// Warning repeat count are all guesses pending a real daytime bench
+// test, per the project's own guardrail on that. The Critical 2-minute
+// cap and Watch/Warning/Critical tone-count-by-severity are Dan's
+// explicit decisions (this session), not placeholders.
+struct AlarmPatternParams {
+  int toneCount;             // tones per group: 3=Critical, 2=Warning, 1=Watch
+  int freqHz;
+  int toneMs;
+  int gapMs;                 // silence between tones within one group
+  int groupPauseMs;          // silence between repeated groups
+  int maxGroups;             // 0 = no sound; >=1 = stop after N groups; -1 = unlimited (time-capped instead)
+  unsigned long maxDurationMs;  // 0 = no time cap (Warning/Watch self-limit via maxGroups instead)
+};
+
+AlarmPatternParams alarmParamsFor(const String &level) {
+  if (level == "critical") {
+    // Dan's explicit decision: an SOS-style 3-tone group, repeating,
+    // capped at 2 minutes if never acknowledged -- past that, continuing
+    // to sound accomplishes nothing (no one present, or busy preparing),
+    // so it stops and leaves the alert visible on screen instead.
+    return {3, 1800, 150, 100, 700, -1, 120000UL};
+  }
+  if (level == "warning") {
+    return {2, 1400, 150, 100, 700, 5, 0UL};  // 5 groups is a placeholder "limited repeats"
+  }
+  if (level == "watch") {
+    return {1, 1000, 300, 0, 0, 1, 0UL};  // a single soft chime, once
+  }
+  // advisory / informational / unrecognized: no sound, banner only,
+  // matching the already-approved visual-only treatment for these tiers.
+  return {0, 0, 0, 0, 0, 0, 0UL};
+}
+
+// Episode identity (which alert+level this state belongs to) is tracked
+// SEPARATELY from whether the episode is still active -- a Watch chime
+// that has already played its one tone, or a Warning/Critical that has
+// hit its repeat/time cap, must stay silent for that same alert+level
+// for as long as nothing about it changes, not restart on every
+// subsequent loop() pass just because needs_alert is still true. Mute
+// and quiet hours PAUSE ticking without ending the episode, so
+// unmuting mid-Critical-alarm resumes it rather than silently losing it.
+bool alarmEpisodeActive = false;
+String alarmEpisodeAlertId = "";
+String alarmEpisodeLevel = "";
+AlarmPatternParams activeAlarmParams;
+int alarmToneIndex = 0;
+int alarmGroupsDone = 0;
+bool alarmInGap = false;
+unsigned long alarmEpisodeStartedAtMillis = 0;
+unsigned long alarmNextActionAtMillis = 0;
+
+// Volume: raw 0-255 M5Unified input, same "no false precision" reasoning
+// as brightness -- unlike brightness, no hardware quirk has been found
+// (or looked for) that collapses this into coarse steps, so it isn't
+// stepped through a fixed level table the way brightness is; the
+// Settings stepper just moves it by a flat increment. In memory only,
+// like every other Settings value -- resets on reboot until persistence
+// is built.
+uint8_t alarmVolume = 200;
+const int ALARM_VOLUME_STEP = 25;
+
+// Mute: temporary by requirement (project rules: "Mute must be
+// temporary and visibly indicated"). Duration is a placeholder -- Dan
+// hasn't specified one -- fixed at 1 hour per tap rather than
+// adjustable, simplest thing that satisfies "temporary."
+bool audioMuted = false;
+unsigned long muteUntilMillis = 0;
+const unsigned long MUTE_DURATION_MS = 3600000UL;  // 1 hour placeholder
+
+// Quiet hours reuse the SAME schedule as night dimming (isNightTimeNow())
+// rather than a separate one -- Dan's policy (confirmed this session):
+// Warnings and Critical always sound regardless of quiet hours; only a
+// Watch chime is silenced overnight. This is an assumption, not
+// separately confirmed with Dan -- flagged as such; a distinct
+// quiet-hours schedule would be a small, contained change if wanted
+// (a second NIGHT_START/END pair) rather than a redesign.
+bool shouldSuppressForQuietHours(const String &level) {
+  return level == "watch" && isNightTimeNow();
+}
+
+void applyAlarmVolumeImmediately() {
+  M5.Speaker.setVolume(alarmVolume);
+}
+
+// A short, single representative tone so Dan can hear what the CURRENT
+// volume setting sounds like without waiting for a real or simulated
+// alert. Deliberately respects mute -- muted should mean muted, even
+// for a deliberate test -- but always logs, so a tap during mute still
+// has some confirmation it registered.
+void playTestTone() {
+  if (audioMuted) {
+    Serial.println("[settings] Test Tone skipped -- currently muted");
+    return;
+  }
+  M5.Speaker.setVolume(alarmVolume);
+  M5.Speaker.tone(1000, 300, ALERT_TONE_CHANNEL, true);
+  Serial.printf("[settings] Test Tone played at volume %d\n", alarmVolume);
+}
+
+// Formats when the current mute period ends, for the Mute button's
+// sub-caption ("Until 7:42 PM"). Falls back to a plain label if the
+// clock isn't synced, since a wall-clock time would be a guess.
+String formatMuteUntil() {
+  if (!timeSynced) return "Temporary (clock not synced)";
+  long remainingSec = (long)(muteUntilMillis - millis()) / 1000;
+  if (remainingSec < 0) remainingSec = 0;
+  long targetEpoch = (long)time(nullptr) + remainingSec;
+  return "Until " + formatEpochLocal(targetEpoch);
+}
+
+// Toggles mute from the Settings Mute button: OFF->ON starts a fresh
+// MUTE_DURATION_MS window; ON->OFF (tapping to cancel early) clears it
+// immediately. A currently-running alarm is stopped the same way an
+// acknowledgement stops one -- see handleAlarm()'s own mute check below,
+// which runs on the very next loop() pass regardless.
+void toggleMute() {
+  audioMuted = !audioMuted;
+  if (audioMuted) {
+    muteUntilMillis = millis() + MUTE_DURATION_MS;
+    Serial.println("[settings] Mute ON");
+  } else {
+    Serial.println("[settings] Mute OFF (cancelled)");
+  }
+}
+
+// Called every loop() pass. Auto-clears mute once its window elapses --
+// "temporary" is a hard requirement, not just a UI label that happens to
+// be true if someone remembers to tap it off.
+void handleMuteExpiry() {
+  if (audioMuted && millis() >= muteUntilMillis) {
+    audioMuted = false;
+    Serial.println("[settings] Mute expired -- audio re-enabled");
+  }
+}
+
+// Called every loop() pass. Drives the whole alarm pattern (tone
+// timing, inter-tone gaps, group repeats, the Critical time cap) purely
+// by comparing millis() against scheduled times -- see the module
+// comment above for why this can never use delay().
+void handleAlarm() {
+  bool sameEpisodeAsBefore = (alarmEpisodeAlertId == nwsFirstAlertId &&
+                              alarmEpisodeLevel == nwsFirstAlertLevel);
+
+  if (!nwsFirstAlertNeedsAlert) {
+    // Acknowledged, or no active alert needing sound: end whatever
+    // episode might be in flight. A later alert (even a different one
+    // that happens to reuse this same id after expiring) will be a
+    // fresh episode by definition once it re-appears with needs_alert.
+    if (alarmEpisodeActive) {
+      alarmEpisodeActive = false;
+      Serial.println("[alarm] episode ended (acknowledged or cleared)");
+    }
+    return;
+  }
+
+  if (!sameEpisodeAsBefore) {
+    // A genuinely new alert, or the same alert escalated to a new level
+    // (which per Dan's confirmed policy clears acknowledgement and
+    // re-alerts) -- start a brand-new episode.
+    activeAlarmParams = alarmParamsFor(nwsFirstAlertLevel);
+    alarmEpisodeAlertId = nwsFirstAlertId;
+    alarmEpisodeLevel = nwsFirstAlertLevel;
+    if (activeAlarmParams.toneCount == 0) {
+      alarmEpisodeActive = false;  // advisory/informational: silent, but the key is still "claimed"
+      return;
+    }
+    alarmEpisodeActive = true;
+    alarmToneIndex = 0;
+    alarmGroupsDone = 0;
+    alarmInGap = false;
+    alarmEpisodeStartedAtMillis = millis();
+    alarmNextActionAtMillis = millis();  // fire the first tone on this very pass
+    Serial.printf("[alarm] starting '%s' for alert %s\n", alarmEpisodeLevel.c_str(), alarmEpisodeAlertId.c_str());
+  }
+
+  // This exact episode already ran its course (hit its cap or repeat
+  // limit) or is silent by design -- do not restart on your own just
+  // because needs_alert is still true on a later pass.
+  if (!alarmEpisodeActive) return;
+
+  // Mute and quiet hours PAUSE ticking rather than ending the episode --
+  // unmuting (or morning arriving) resumes from exactly where it left
+  // off, rather than losing an unacknowledged alarm to a temporary mute.
+  if (audioMuted || shouldSuppressForQuietHours(alarmEpisodeLevel)) return;
+
+  unsigned long now = millis();
+  if (now < alarmNextActionAtMillis) return;
+
+  if (activeAlarmParams.maxDurationMs > 0 &&
+      (now - alarmEpisodeStartedAtMillis) >= activeAlarmParams.maxDurationMs) {
+    alarmEpisodeActive = false;
+    Serial.println("[alarm] time cap reached -- episode over (the alert itself stays visible on screen)");
+    return;
+  }
+
+  if (!alarmInGap) {
+    M5.Speaker.setVolume(alarmVolume);
+    M5.Speaker.tone(activeAlarmParams.freqHz, activeAlarmParams.toneMs, ALERT_TONE_CHANNEL, true);
+    alarmToneIndex++;
+    if (alarmToneIndex < activeAlarmParams.toneCount) {
+      alarmNextActionAtMillis = now + activeAlarmParams.toneMs + activeAlarmParams.gapMs;
+    } else {
+      alarmToneIndex = 0;
+      alarmGroupsDone++;
+      if (activeAlarmParams.maxGroups > 0 && alarmGroupsDone >= activeAlarmParams.maxGroups) {
+        alarmEpisodeActive = false;
+        Serial.println("[alarm] reached its repeat limit -- episode over (the alert stays visible on screen)");
+        return;
+      }
+      alarmInGap = true;
+      alarmNextActionAtMillis = now + activeAlarmParams.toneMs + activeAlarmParams.groupPauseMs;
+    }
+  } else {
+    alarmInGap = false;
+    alarmNextActionAtMillis = now;  // play the next group's first tone immediately on the next check
+  }
 }
 
 // -1 = not yet applied (forces the very first loop() pass to set a real
@@ -1932,6 +2236,7 @@ String formatCurrentTime() {
 #endif
 const char *SERVER_URL = SERVER_BASE_URL "/api/conditions";
 const char *ACK_URL = SERVER_BASE_URL "/api/alerts/ack";
+const char *SIMULATION_START_URL = SERVER_BASE_URL "/api/simulation/start";
 
 // PLACEHOLDERS -- tune after reading real timing from the serial log.
 const int32_t HTTP_CONNECT_TIMEOUT_MS = 2000;
@@ -2028,6 +2333,7 @@ void fetchConditions() {
     nwsFirstAlertHazard = alerts[0]["hazard"] | "";
     nwsFirstAlertAcknowledged = alerts[0]["acknowledged"];
     nwsFirstAlertNeedsAlert = alerts[0]["needs_alert"];
+    nwsFirstAlertLevel = alerts[0]["level"] | "";
   } else {
     nwsFirstAlertEvent = "";
     nwsFirstAlertExpires = "";
@@ -2037,6 +2343,7 @@ void fetchConditions() {
     nwsFirstAlertHazard = "";
     nwsFirstAlertAcknowledged = false;
     nwsFirstAlertNeedsAlert = false;
+    nwsFirstAlertLevel = "";
   }
 
   hasEverFetchedSuccessfully = true;
@@ -2089,6 +2396,35 @@ void ackAlert(const String &alertId) {
                   httpCode, HTTPClient::errorToString(httpCode).c_str());
   }
   http.end();
+}
+
+// "RUN TEST ALERT" (Settings, Mute page). Same POST pattern as
+// ackAlert() -- this triggers the server's own simulation engine (built
+// Session 10) rather than faking anything device-side, so what plays
+// through the alarm engine below is the real alert-lifecycle path, just
+// fed synthetic data.
+void startRunTestAlertScenario() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[settings] Run Test Alert skipped -- no Wi-Fi");
+    return;
+  }
+  Serial.println("[settings] Starting nws_lifecycle simulation...");
+  HTTPClient http;
+  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+  http.setTimeout(HTTP_READ_TIMEOUT_MS);
+  http.begin(SIMULATION_START_URL);
+  http.addHeader("Content-Type", "application/json");
+  JsonDocument doc;
+  doc["scenario"] = "nws_lifecycle";
+  String body;
+  serializeJson(doc, body);
+  int httpCode = http.POST(body);
+  Serial.printf("[settings] simulation/start returned %d\n", httpCode);
+  http.end();
+  // Deliberately not forced onto screen immediately -- the next periodic
+  // fetch (up to 60s) will pick it up naturally, same as any other
+  // conditions change. This is a bench-test convenience, not something
+  // that needs to feel instantaneous.
 }
 
 void setup() {
@@ -2192,6 +2528,8 @@ void loop() {
   // which page is showing (v1.0 requirement, §24).
   handleWifiAndNtpReconnect();
   handleNightDimming();
+  handleMuteExpiry();
+  handleAlarm();
 
   // Idle auto-return to Now
   if (currentPage != PAGE_NOW &&
