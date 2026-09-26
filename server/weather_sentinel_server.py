@@ -811,10 +811,85 @@ def build_simulated_conditions(scenario_name, step_index):
     }
 
 
-ALERT_EXPIRY_CLEANUP_MINUTES = 30  # how long an expired alert stays
-                                     # visible internally before being
-                                     # dropped, bounding memory growth
-                                     # without needing real persistence
+# How long an expired alert is kept (in memory and in the persisted state
+# file) before being dropped. Session 12: raised from 30 minutes to 24
+# hours so the device's Alert History page can show the last day. Side
+# benefit: if NWS briefly drops an alert from its feed and re-adds it
+# (same id) within a day, it resumes with its acknowledgement intact
+# instead of sounding again as brand new.
+ALERT_HISTORY_HOURS = 24
+ALERT_EXPIRY_CLEANUP_MINUTES = ALERT_HISTORY_HOURS * 60
+
+# Alert History payload bounds (the device holds this in RAM, and it is
+# fetched only when someone opens the History page).
+ALERT_HISTORY_MAX_ALERTS = 12
+ALERT_HISTORY_MAX_INSTRUCTION = 400
+
+
+def _iso_to_epoch(iso):
+    """ISO-8601 string -> Unix seconds, or None. Never raises."""
+    try:
+        return int(datetime.fromisoformat(iso).timestamp()) if iso else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _history_entry(alert, status, ended_iso):
+    """Compact, bounded history record in the shape the device reads."""
+    return {
+        "id": alert.get("id"),
+        "event": alert.get("event"),
+        "level": alert.get("level"),
+        "status": status,                      # "active" | "expired"
+        "acknowledged": bool(alert.get("acknowledged")),
+        "first_seen_epoch": _iso_to_epoch(alert.get("first_seen_at")),
+        "ended_epoch": _iso_to_epoch(ended_iso) if status == "expired" else None,
+        "what": alert.get("what"),
+        "hazard": alert.get("hazard"),
+        "instruction": _bound(alert.get("instruction"), ALERT_HISTORY_MAX_INSTRUCTION),
+    }
+
+
+def build_alert_history_locked():
+    """Last 24 hours of real NWS alerts. Caller must hold state_lock.
+
+    Active alerts first, in the same order /api/conditions uses (so entry
+    0 matches what the device is showing), then expired alerts, most
+    recently ended first. Expired alerts older than the retention window
+    are already pruned by process_nws_alerts_locked().
+    """
+    active, expired = [], []
+    for a in tracked_alerts.values():
+        if a.get("last_transition") == "expired":
+            expired.append(a)
+        else:
+            active.append({**a, "needs_alert": (
+                a.get("last_transition") in ("new", "escalated")
+                and not a.get("acknowledged"))})
+    entries = [_history_entry(a, "active", None) for a in sort_alerts_for_device(active)]
+    expired.sort(key=lambda a: a.get("last_updated_at") or "", reverse=True)
+    entries += [_history_entry(a, "expired", a.get("last_updated_at")) for a in expired]
+    return entries[:ALERT_HISTORY_MAX_ALERTS]
+
+
+def build_simulated_history(scenario_name, step_index):
+    """History during a simulation: the current step's alerts as active,
+    plus any alert that appeared in an EARLIER step of the scenario but is
+    gone now, as expired (ended "now"). Real history is never mixed in."""
+    scenario = SIMULATION_SCENARIOS[scenario_name]
+    current = build_simulated_conditions(scenario_name, step_index)["nws"]["alerts"]
+    now_iso = datetime.now(timezone.utc).isoformat()
+    entries = [_history_entry(a, "active", None) for a in current]
+    current_ids = {a["id"] for a in current}
+    seen = set()
+    for earlier in reversed(scenario[:step_index]):
+        for template in earlier.get("alerts", []):
+            if template["id"] in current_ids or template["id"] in seen:
+                continue
+            seen.add(template["id"])
+            a = dict(template, first_seen_at=now_iso)
+            entries.append(_history_entry(a, "expired", now_iso))
+    return entries[:ALERT_HISTORY_MAX_ALERTS]
 
 
 def process_nws_alerts_locked(raw_props_list):
@@ -1100,6 +1175,30 @@ def api_conditions():
         },
         "simulation": False,
     })
+
+
+@app.route("/api/alerts/history")
+def api_alert_history():
+    """Alert History page (Session 12). Fetched by the device only when
+    the page is opened, never on the 60-second poll, so /api/conditions
+    stays small. Same simulation safety as /api/conditions: a real active
+    alert ends any running simulation before anything is served."""
+    with state_lock:
+        real_active = any(a.get("last_transition") != "expired"
+                          for a in tracked_alerts.values())
+        if simulation_state["active"] and real_active:
+            print("[simulation] REAL alert active -- auto-stopping simulation "
+                  "(history request)", flush=True)
+            simulation_state.update(active=False, scenario=None, step=0)
+        if simulation_state["active"]:
+            scenario, step = simulation_state["scenario"], simulation_state["step"]
+            entries, sim = None, True
+        else:
+            entries, sim = build_alert_history_locked(), False
+    if sim:
+        # Built outside the lock: build_simulated_conditions() doesn't need it.
+        entries = build_simulated_history(scenario, step)
+    return jsonify({"hours": ALERT_HISTORY_HOURS, "simulation": sim, "alerts": entries})
 
 
 @app.route("/api/alerts/ack", methods=["POST"])

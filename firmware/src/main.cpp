@@ -48,6 +48,9 @@ void toggleMute();
 void playTestTone();
 void startRunTestAlertScenario();
 String formatMuteUntil();
+
+// Alert History (Session 12): the fetch lives with the other HTTP code.
+void fetchAlertHistory();
 bool isNightTimeNow();
 extern const int ALARM_VOLUME_STEP;
 
@@ -1137,6 +1140,66 @@ int layoutAlertBody(const String &whatIn, const String &hazardIn, const String &
   return n;
 }
 
+// The NWS Alerts page's coloured event/until block. Shared by the drawing
+// code and the touch handler: while "+N more >" is shown, a tap anywhere
+// in this block opens Alert History (Session 12).
+const int NWS_HEADER_X = 16, NWS_HEADER_Y = 48, NWS_HEADER_W = 288, NWS_HEADER_H = 34;
+
+// The body below an alert's coloured header block (y >= 90): layout B
+// (WHAT'S HAPPENING / HAZARD / INSTRUCTION) when the server supplied a
+// headline or hazard, else the instruction-only layout. Shared by the
+// NWS Alerts page and the Alert History detail view (Session 12) so the
+// two can never lay the same alert out differently.
+void drawAlertBody(const String &what, const String &hazard, const String &instruction) {
+  M5.Display.setTextDatum(top_left);
+  // Instruction: full official text, word-wrapped and truncated with an
+  // indicator if it runs longer than the available space.
+  // Approved layout B: WHAT'S HAPPENING / HAZARD / INSTRUCTION, when the
+  // server supplied a headline or hazard for this alert.
+  PageLine pageLines[NWS_MAX_PAGE_LINES];
+  int pageLineCount = layoutAlertBody(what, hazard,
+                                      instruction, pageLines);
+  if (pageLineCount > 0) {
+    for (int i = 0; i < pageLineCount; i++) {
+      uint16_t color = COLOR_TEXT_SECONDARY;
+      if (pageLines[i].role == ROLE_LABEL) color = COLOR_TEXT_DIM;
+      else if (pageLines[i].role == ROLE_HAZARD) color = COLOR_TEXT_PRIMARY;
+      M5.Display.setTextColor(color, COLOR_BG);
+      M5.Display.setTextSize(pageLines[i].size);
+      M5.Display.drawString(pageLines[i].text, 16, pageLines[i].y);
+    }
+    return;
+  }
+
+  // Otherwise (no headline/hazard from the server): the instruction-only
+  // layout, unchanged.
+  M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+  M5.Display.setTextSize(1);
+  M5.Display.drawString("INSTRUCTION", 16, 92);
+
+  String wrappedLines[NWS_LINES_SMALL];
+  int instrSize, instrLineH;
+  bool instrTruncated;
+  int lineCount = layoutInstruction(instruction, wrappedLines,
+                                    instrSize, instrLineH, instrTruncated);
+
+  int y = 106;
+  if (lineCount == 0) {
+    // Some NWS products carry no instruction text at all.
+    M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+    M5.Display.setTextSize(1);
+    M5.Display.drawString("(no instruction text provided)", 16, y);
+    return;
+  }
+
+  M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
+  M5.Display.setTextSize(instrSize);
+  for (int i = 0; i < lineCount; i++) {
+    M5.Display.drawString(wrappedLines[i], 16, y);
+    y += instrLineH;
+  }
+}
+
 void drawNwsAlertsPage() {
   drawSecondaryHeader("NWS Alerts", PAGE_NWS_ALERTS);
 
@@ -1175,7 +1238,7 @@ void drawNwsAlertsPage() {
   // see project brief for the reasoning Dan approved). Now using the
   // real first active alert's event name and expiration.
   AlertColors c = currentAlertColors();
-  M5.Display.fillRect(16, 48, 288, 34, c.bg);
+  M5.Display.fillRect(NWS_HEADER_X, NWS_HEADER_Y, NWS_HEADER_W, NWS_HEADER_H, c.bg);
   M5.Display.setTextColor(c.headline, c.bg);
   String eventName = shortenEventName(nwsFirstAlertEvent);
   int eventSize = eventTextSize(eventName, 272);   // x = 24 .. 296, inside the 16..304 box
@@ -1194,57 +1257,14 @@ void drawNwsAlertsPage() {
   if (showMore) {
     M5.Display.setTextColor(c.headline, c.bg);
     M5.Display.setTextDatum(top_right);
-    M5.Display.drawString(nwsMoreText(), 296, 72);
+    // " >" marks it as tappable: the whole coloured block opens Alert
+    // History (Session 12). 54 px wide, so it still clears the short
+    // stale form of the until text (ends x=228).
+    M5.Display.drawString(nwsMoreText() + " >", 296, 72);
     M5.Display.setTextDatum(top_left);
   }
 
-  // Instruction: full official text, word-wrapped and truncated with an
-  // indicator if it runs longer than the available space. Now using the
-  // real instruction text from the active alert.
-  // Approved layout B: WHAT'S HAPPENING / HAZARD / INSTRUCTION, when the
-  // server supplied a headline or hazard for this alert.
-  PageLine pageLines[NWS_MAX_PAGE_LINES];
-  int pageLineCount = layoutAlertBody(nwsFirstAlertWhat, nwsFirstAlertHazard,
-                                      nwsFirstAlertInstruction, pageLines);
-  if (pageLineCount > 0) {
-    for (int i = 0; i < pageLineCount; i++) {
-      uint16_t color = COLOR_TEXT_SECONDARY;
-      if (pageLines[i].role == ROLE_LABEL) color = COLOR_TEXT_DIM;
-      else if (pageLines[i].role == ROLE_HAZARD) color = COLOR_TEXT_PRIMARY;
-      M5.Display.setTextColor(color, COLOR_BG);
-      M5.Display.setTextSize(pageLines[i].size);
-      M5.Display.drawString(pageLines[i].text, 16, pageLines[i].y);
-    }
-    return;
-  }
-
-  // Otherwise (no headline/hazard from the server): the instruction-only
-  // layout, unchanged.
-  M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
-  M5.Display.setTextSize(1);
-  M5.Display.drawString("INSTRUCTION", 16, 92);
-
-  String wrappedLines[NWS_LINES_SMALL];
-  int instrSize, instrLineH;
-  bool instrTruncated;
-  int lineCount = layoutInstruction(nwsFirstAlertInstruction, wrappedLines,
-                                    instrSize, instrLineH, instrTruncated);
-
-  int y = 106;
-  if (lineCount == 0) {
-    // Some NWS products carry no instruction text at all.
-    M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
-    M5.Display.setTextSize(1);
-    M5.Display.drawString("(no instruction text provided)", 16, y);
-    return;
-  }
-
-  M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
-  M5.Display.setTextSize(instrSize);
-  for (int i = 0; i < lineCount; i++) {
-    M5.Display.drawString(wrappedLines[i], 16, y);
-    y += instrLineH;
-  }
+  drawAlertBody(nwsFirstAlertWhat, nwsFirstAlertHazard, nwsFirstAlertInstruction);
 }
 
 void drawStatusPage() {
@@ -1352,7 +1372,9 @@ const int SETTINGS_LABEL_ONLY_H = 18;   // a bare label line + gap
 // 0 every time Settings is entered via long-press, so it always starts
 // on Volume + Test Tone rather than remembering where you left off.
 int settingsSubPage = 0;
-const int SETTINGS_NUM_SUBPAGES = 4;
+const int SETTINGS_NUM_SUBPAGES = 5;
+// Page 5 (index 4): Alert History, added Session 12.
+const int SETTINGS_PAGE_HISTORY = 4;
 
 void drawSettingsHeader(const char *title) {
   M5.Display.fillScreen(COLOR_BG);
@@ -1413,7 +1435,7 @@ void drawSettingsButtonRow(int y, int h, const String &label, uint16_t color,
   }
 }
 
-void drawSettingsNavBar() {
+void drawSettingsNavBar(const char *centreLabel = "DONE") {
   M5.Display.fillRect(0, SETTINGS_NAV_Y, 320, SETTINGS_NAV_H, COLOR_BG);
   M5.Display.drawFastHLine(0, SETTINGS_NAV_Y, 320, COLOR_SEPARATOR);
   M5.Display.drawFastVLine(SETTINGS_NAV_PREV_X1, SETTINGS_NAV_Y, SETTINGS_NAV_H, COLOR_SEPARATOR);
@@ -1425,7 +1447,7 @@ void drawSettingsNavBar() {
   M5.Display.drawString("<", (SETTINGS_NAV_PREV_X0 + SETTINGS_NAV_PREV_X1) / 2, midY);
   M5.Display.drawString(">", (SETTINGS_NAV_NEXT_X0 + SETTINGS_NAV_NEXT_X1) / 2, midY);
   M5.Display.setTextColor(COLOR_NWS_CLEAR_TEXT, COLOR_BG);
-  M5.Display.drawString("DONE", (SETTINGS_NAV_DONE_X0 + SETTINGS_NAV_DONE_X1) / 2, midY);
+  M5.Display.drawString(centreLabel, (SETTINGS_NAV_DONE_X0 + SETTINGS_NAV_DONE_X1) / 2, midY);
 }
 
 // 12-hour "H:MM AM/PM" formatting for the schedule page -- same
@@ -1502,12 +1524,233 @@ void drawSettingsSchedulePage() {
   drawSettingsNavBar();
 }
 
+// ---- Settings page 5: Alert History (Session 12, approved mockup) ----
+// The last 24 hours of NWS alerts, newest first, from the server's
+// GET /api/alerts/history. Fetched only when the page is opened (never on
+// the 60-second poll), so the normal fetch stays small. Tapping a row opens
+// that alert's full detail, drawn by the same drawAlertBody() the NWS
+// Alerts page uses; < > then step through the list and BACK returns to it.
+// This is also how the alerts behind a "+N more" can be read.
+
+struct HistoryAlert {
+  String id, event, level, what, hazard, instruction;
+  bool active = false, acknowledged = false;
+  long firstSeenEpoch = 0, endedEpoch = 0;
+};
+
+const int HISTORY_MAX = 12;           // matches the server's bound
+HistoryAlert historyAlerts[HISTORY_MAX];
+int historyCount = 0;
+
+// NOT_LOADED while the request is in flight; FAILED is shown as
+// "History unavailable", never as an empty list -- the same rule as
+// "NO ACTIVE ALERTS": a failed check must never read as "nothing happened".
+enum HistoryLoad { HISTORY_NOT_LOADED, HISTORY_OK, HISTORY_FAILED };
+HistoryLoad historyLoad = HISTORY_NOT_LOADED;
+bool historySimulation = false;
+
+int historyListOffset = 0;    // first entry shown when paging "older"
+int historyDetailIndex = -1;  // -1 = list view, else the entry shown
+
+// List geometry, shared by drawing and hit-testing.
+const int HISTORY_ROW_Y0 = 56;
+const int HISTORY_ROW_H = 38;
+const int HISTORY_ROWS = 4;          // visible slots (3 + a paging row when > 4)
+const int HISTORY_TEXT_X = 28;
+const int HISTORY_LINE_MAX_CHARS = (304 - HISTORY_TEXT_X) / GLYPH_W_SIZE1;   // 46
+
+// Entries shown per page: all four slots when everything fits, otherwise
+// three entries plus a paging row in the last slot.
+int historyEntriesPerPage() {
+  return historyCount <= HISTORY_ROWS ? HISTORY_ROWS : HISTORY_ROWS - 1;
+}
+
+// "3:10 PM", or "Yesterday 6:12 PM" for anything before today (the list
+// only covers 24 hours). "--:--" if the clock isn't synced.
+String formatHistoryTime(long epoch, bool allowDayPrefix) {
+  String t = formatEpochLocal(epoch);
+  if (!allowDayPrefix || !timeSynced || epoch <= 0) return t;
+  time_t e = (time_t)epoch, now = time(nullptr);
+  struct tm te, tn;
+  localtime_r(&e, &te);
+  localtime_r(&now, &tn);
+  if (te.tm_year == tn.tm_year && te.tm_yday == tn.tm_yday) return t;
+  return "Yesterday " + t;
+}
+
+// One status line per entry, fitted to maxChars: "Since 3:10 PM  ACTIVE
+// not acknowledged" or "1:05 PM - 2:30 PM  ended". The acknowledgement
+// note is dropped (never cut mid-word) if the line would not fit.
+String historyStatusLine(const HistoryAlert &a, int maxChars) {
+  if (a.active) {
+    String base = "Since " + formatHistoryTime(a.firstSeenEpoch, true) + "  ACTIVE";
+    String withAck = base + (a.acknowledged ? "  acknowledged" : "  not acknowledged");
+    return (int)withAck.length() <= maxChars ? withAck : fitChars(base, maxChars);
+  }
+  String line = formatHistoryTime(a.firstSeenEpoch, true) + " - " +
+                formatHistoryTime(a.endedEpoch, false) + "  ended";
+  return fitChars(line, maxChars);
+}
+
+void drawHistoryRow(int y, const HistoryAlert &a) {
+  AlertColors c = alertColorsForLevel(a.level);
+  uint16_t nameColor = a.active ? c.headline : COLOR_TEXT_SECONDARY;
+  uint16_t lineColor = a.active ? c.detail : COLOR_TEXT_DIM;
+  M5.Display.fillRect(16, y + 3, 4, 30, a.active ? c.headline : c.detail);
+  M5.Display.setTextDatum(top_left);
+  String name = shortenEventName(a.event);
+  int size = eventTextSize(name, 304 - HISTORY_TEXT_X);
+  M5.Display.setTextColor(nameColor, COLOR_BG);
+  M5.Display.setTextSize(size);
+  M5.Display.drawString(fitChars(name, HISTORY_LINE_MAX_CHARS), HISTORY_TEXT_X,
+                        size == 2 ? y + 3 : y + 7);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(lineColor, COLOR_BG);
+  M5.Display.drawString(historyStatusLine(a, HISTORY_LINE_MAX_CHARS), HISTORY_TEXT_X, y + 23);
+  M5.Display.drawFastHLine(16, y + 37, 288, COLOR_SEPARATOR);
+}
+
+void drawAlertHistoryList() {
+  drawSettingsHeader("Alert History");
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+
+  if (historyLoad == HISTORY_NOT_LOADED) {
+    M5.Display.drawString("LAST 24 HOURS, NEWEST FIRST", 16, 44);
+    M5.Display.setTextSize(2);
+    M5.Display.drawString("Loading...", 16, 72);
+  } else if (historyLoad == HISTORY_FAILED) {
+    M5.Display.drawString("LAST 24 HOURS, NEWEST FIRST", 16, 44);
+    M5.Display.setTextSize(2);
+    M5.Display.drawString("History unavailable", 16, 72);
+    M5.Display.setTextSize(1);
+    M5.Display.drawString(WiFi.status() == WL_CONNECTED
+                              ? "Server not responding -- this is NOT"
+                              : "Wi-Fi disconnected -- this is NOT",
+                          16, 96);
+    M5.Display.drawString("the same as no alerts.", 16, 106);
+  } else if (historyCount == 0) {
+    M5.Display.drawString("LAST 24 HOURS, NEWEST FIRST", 16, 44);
+    M5.Display.fillCircle(28, 80, 5, COLOR_NWS_CLEAR_DOT);
+    M5.Display.setTextColor(COLOR_NWS_CLEAR_TEXT, COLOR_BG);
+    M5.Display.setTextSize(2);
+    M5.Display.drawString("No NWS alerts in", 42, 72);
+    M5.Display.drawString("the last 24 hours", 42, 92);
+  } else {
+    M5.Display.drawString("LAST 24 HOURS, NEWEST FIRST -- TAP FOR DETAIL", 16, 44);
+    int perPage = historyEntriesPerPage();
+    for (int slot = 0; slot < perPage; slot++) {
+      int i = historyListOffset + slot;
+      if (i >= historyCount) break;
+      drawHistoryRow(HISTORY_ROW_Y0 + slot * HISTORY_ROW_H, historyAlerts[i]);
+    }
+    if (perPage < HISTORY_ROWS) {
+      int remaining = historyCount - (historyListOffset + perPage);
+      String pager = "Newest -- tap to show";
+      if (remaining > 0) pager = String(remaining) + " older -- tap to show";
+      M5.Display.setTextDatum(top_left);
+      M5.Display.setTextColor(COLOR_LIGHTNING_TEXT, COLOR_BG);
+      M5.Display.setTextSize(2);
+      M5.Display.drawString(pager, HISTORY_TEXT_X,
+                            HISTORY_ROW_Y0 + (HISTORY_ROWS - 1) * HISTORY_ROW_H + 13);
+    }
+  }
+  drawSettingsNavBar("DONE");
+}
+
+void drawAlertHistoryDetail() {
+  const HistoryAlert &a = historyAlerts[historyDetailIndex];
+  M5.Display.fillScreen(COLOR_BG);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(COLOR_TEXT_PRIMARY, COLOR_BG);
+  M5.Display.setTextSize(3);
+  M5.Display.drawString("History", 16, 10);
+  M5.Display.setTextDatum(top_right);
+  M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+  M5.Display.setTextSize(1);
+  M5.Display.drawString(String(historyDetailIndex + 1) + " of " + String(historyCount), 304, 14);
+  M5.Display.drawFastHLine(16, 38, 288, COLOR_SEPARATOR);
+
+  // Same block, fonts and colour tier as the NWS Alerts page header.
+  AlertColors c = alertColorsForLevel(a.level);
+  M5.Display.fillRect(NWS_HEADER_X, NWS_HEADER_Y, NWS_HEADER_W, NWS_HEADER_H, c.bg);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(c.headline, c.bg);
+  String name = shortenEventName(a.event);
+  int size = eventTextSize(name, 272);
+  M5.Display.setTextSize(size);
+  M5.Display.drawString(name, 24, size == 2 ? 54 : 58);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(c.detail, c.bg);
+  M5.Display.drawString(historyStatusLine(a, (296 - 24) / GLYPH_W_SIZE1), 24, 72);
+
+  drawAlertBody(a.what, a.hazard, a.instruction);
+  drawSettingsNavBar("BACK");
+}
+
+void drawAlertHistoryPage() {
+  if (historyDetailIndex >= 0 && historyDetailIndex < historyCount) {
+    drawAlertHistoryDetail();
+  } else {
+    historyDetailIndex = -1;
+    drawAlertHistoryList();
+  }
+}
+
+// Opens the list fresh: shows "Loading...", fetches (blocking, same
+// timeouts as every other request), then redraws with the result.
+void openAlertHistory() {
+  historyLoad = HISTORY_NOT_LOADED;
+  historyListOffset = 0;
+  historyDetailIndex = -1;
+  renderPage(currentPage);
+  fetchAlertHistory();
+  renderPage(currentPage);
+}
+
+// Touch handling for page 5. Returns true if it consumed the tap. The nav
+// bar is only taken over in detail view (< > step, centre = BACK); in the
+// list view the usual Settings bar (< > pages, DONE) applies.
+bool handleAlertHistoryTouch(int x, int y) {
+  if (historyDetailIndex >= 0) {
+    if (y < SETTINGS_NAV_Y) return true;   // reading; ignore stray taps
+    if (x < SETTINGS_NAV_PREV_X1) {
+      historyDetailIndex = (historyDetailIndex + historyCount - 1) % historyCount;
+    } else if (x < SETTINGS_NAV_DONE_X1) {
+      historyDetailIndex = -1;             // BACK to the list
+    } else {
+      historyDetailIndex = (historyDetailIndex + 1) % historyCount;
+    }
+    renderPage(currentPage);
+    return true;
+  }
+  if (y >= SETTINGS_NAV_Y) return false;   // list view: normal Settings bar
+  if (historyLoad != HISTORY_OK || historyCount == 0) return true;
+  if (y < HISTORY_ROW_Y0 || y >= HISTORY_ROW_Y0 + HISTORY_ROWS * HISTORY_ROW_H) return true;
+
+  int slot = (y - HISTORY_ROW_Y0) / HISTORY_ROW_H;
+  int perPage = historyEntriesPerPage();
+  if (slot >= perPage) {
+    // The paging row: next page of older entries, wrapping to the newest.
+    historyListOffset += perPage;
+    if (historyListOffset >= historyCount) historyListOffset = 0;
+  } else {
+    int i = historyListOffset + slot;
+    if (i >= historyCount) return true;
+    historyDetailIndex = i;
+  }
+  renderPage(currentPage);
+  return true;
+}
+
 void drawSettingsPage() {
   switch (settingsSubPage) {
     case 0: drawSettingsVolumePage(); break;
     case 1: drawSettingsMutePage(); break;
     case 2: drawSettingsBrightnessPage(); break;
-    default: drawSettingsSchedulePage(); break;
+    case 3: drawSettingsSchedulePage(); break;
+    default: drawAlertHistoryPage(); break;
   }
 }
 
@@ -1519,6 +1762,8 @@ void drawSettingsPage() {
 // are matched against each page's known hotspots and logged, since
 // nothing on those pages is wired to a real value yet.
 void handleSettingsTouch(int x, int y) {
+  if (settingsSubPage == SETTINGS_PAGE_HISTORY && handleAlertHistoryTouch(x, y)) return;
+
   if (y >= SETTINGS_NAV_Y) {
     if (x < SETTINGS_NAV_PREV_X1) {
       settingsSubPage = (settingsSubPage + SETTINGS_NUM_SUBPAGES - 1) % SETTINGS_NUM_SUBPAGES;
@@ -1531,6 +1776,10 @@ void handleSettingsTouch(int x, int y) {
     } else {
       settingsSubPage = (settingsSubPage + 1) % SETTINGS_NUM_SUBPAGES;
       Serial.printf("[settings] next -> subpage %d\n", settingsSubPage);
+    }
+    if (settingsSubPage == SETTINGS_PAGE_HISTORY) {
+      openAlertHistory();   // fresh fetch every time the page is entered
+      return;
     }
     renderPage(currentPage);
     return;
@@ -2452,6 +2701,62 @@ void fetchConditions() {
   Serial.printf("[fetch] OK -- total blocked %lu ms\n", millis() - fetchStart);
 }
 
+const char *ALERT_HISTORY_URL = SERVER_BASE_URL "/api/alerts/history";
+
+// Alert History (Session 12). Blocking, like every request here, with the
+// same short timeouts; called only when the History page is opened. Any
+// failure leaves historyLoad = HISTORY_FAILED ("History unavailable").
+void fetchAlertHistory() {
+  historyCount = 0;
+  historyLoad = HISTORY_FAILED;
+  historySimulation = false;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[history] skipped -- Wi-Fi not connected");
+    return;
+  }
+
+  HTTPClient http;
+  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+  http.setTimeout(HTTP_READ_TIMEOUT_MS);
+  http.begin(ALERT_HISTORY_URL);
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.printf("[history] GET failed: %d (%s)\n", httpCode,
+                  HTTPClient::errorToString(httpCode).c_str());
+    http.end();
+    return;
+  }
+  String payload = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, payload);
+  if (error) {
+    Serial.printf("[history] JSON parse FAILED: %s\n", error.c_str());
+    return;
+  }
+
+  historySimulation = doc["simulation"] | false;
+  JsonArray alerts = doc["alerts"];
+  for (JsonObject a : alerts) {
+    if (historyCount >= HISTORY_MAX) break;
+    HistoryAlert &h = historyAlerts[historyCount++];
+    h.id = a["id"] | "";
+    h.event = a["event"] | "";
+    h.level = a["level"] | "";
+    h.what = a["what"] | "";
+    h.hazard = a["hazard"] | "";
+    h.instruction = a["instruction"] | "";
+    h.active = String(a["status"] | "") == "active";
+    h.acknowledged = a["acknowledged"] | false;
+    h.firstSeenEpoch = a["first_seen_epoch"] | 0L;
+    h.endedEpoch = a["ended_epoch"] | 0L;
+  }
+  historyLoad = HISTORY_OK;
+  Serial.printf("[history] loaded %d alert(s)%s\n", historyCount,
+                historySimulation ? " (simulation)" : "");
+}
+
 // Phase 2g: alert acknowledgement. Same blocking-HTTP characteristic as
 // fetchConditions() above, but user-triggered rather than on a 60s
 // timer, so the impact is a single brief pause on tap rather than a
@@ -2602,9 +2907,22 @@ void loop() {
                                  (tapNwsView == NWS_VIEW_ALERT || tapNwsView == NWS_VIEW_ALERT_STALE) &&
                                  touch.y >= NOW_FOOTER_Y);
 
+    // "+N more >" on the NWS Alerts page: a tap anywhere in the coloured
+    // header block opens Alert History, where every alert can be read.
+    bool tappedMoreAlerts = (currentPage == PAGE_NWS_ALERTS &&
+                             nwsMoreCount() > 0 &&
+                             (tapNwsView == NWS_VIEW_ALERT || tapNwsView == NWS_VIEW_ALERT_STALE) &&
+                             touch.x >= NWS_HEADER_X && touch.x < NWS_HEADER_X + NWS_HEADER_W &&
+                             touch.y >= NWS_HEADER_Y && touch.y < NWS_HEADER_Y + NWS_HEADER_H);
+
     if (tappedAckPrompt) {
       ackAlert(nwsFirstAlertId);
       renderPage(currentPage);  // redraw -- prompt disappears if the ack succeeded
+    } else if (tappedMoreAlerts) {
+      Serial.println("Tap on '+N more' -- opening Alert History");
+      currentPage = PAGE_SETTINGS;
+      settingsSubPage = SETTINGS_PAGE_HISTORY;
+      openAlertHistory();
     } else if (tappedNowAlertFooter) {
       currentPage = PAGE_NWS_ALERTS;
       Serial.println("Tap on Now alert footer -- jumping to NWS Alerts");
