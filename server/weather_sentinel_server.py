@@ -363,6 +363,38 @@ LEVEL_RANK = {
     "critical": 4,
 }
 
+# Levels whose alerts make sound on the device (Session 11 audio ladder:
+# Critical 3 tones, Warning 2, Watch 1; Advisory/Informational silent).
+SOUNDING_LEVELS = ("watch", "warning", "critical")
+
+
+def sort_alerts_for_device(alerts):
+    """Order alerts the way the device should show them (v1.0 item 4).
+
+    The firmware displays, sounds and acknowledges only alerts[0], and
+    shows "+N more" for the rest, so this order IS the device's
+    priority rule:
+      1. An alert that is currently SOUNDING (needs acknowledgement, and
+         at a level that makes sound) goes first, so a new Watch arriving
+         behind an already-acknowledged Warning still chimes and can be
+         acknowledged, rather than staying silent behind it forever.
+      2. Otherwise, highest level first (Critical > Warning > Watch >
+         Advisory > Informational).
+      3. Within a level, the most recently first-seen alert first.
+    Once the sounding alert is acknowledged it drops back into plain
+    level order on the next request. Returns a new list; never raises on
+    a missing field (an unknown level ranks lowest).
+    """
+    def is_sounding(a):
+        return bool(a.get("needs_alert")) and a.get("level") in SOUNDING_LEVELS
+
+    # Python's sort is stable: sort by the tie-breaker first, then by the
+    # primary keys. ISO-8601 UTC strings from this server sort correctly
+    # as text.
+    ordered = sorted(alerts, key=lambda a: a.get("first_seen_at") or "", reverse=True)
+    return sorted(ordered, key=lambda a: (not is_sounding(a),
+                                          -LEVEL_RANK.get(a.get("level"), -1)))
+
 
 # --- "What is actually happening": short, bounded text for the device. ---
 # The device shows WHAT (NWS's own one-line headline, minus its time
@@ -526,7 +558,8 @@ SIMULATION_BASE_LIGHTNING = {
 }
 
 
-def _sim_alert(event, level, hazard, what, instruction, acknowledged, needs_alert, last_transition):
+def _sim_alert(event, level, hazard, what, instruction, acknowledged, needs_alert, last_transition,
+               alert_id=None):
     """Builds one simulated alert dict in the exact shape real alerts use
     (see process_nws_alerts_locked / api_conditions's alerts_copy), so
     firmware parses it identically either way. expires/first_seen_at/
@@ -534,7 +567,7 @@ def _sim_alert(event, level, hazard, what, instruction, acknowledged, needs_aler
     recomputes expires fresh on every request, since a step may sit on
     screen for a long time while it's being examined."""
     return {
-        "id": SIMULATION_ALERT_ID,
+        "id": alert_id or SIMULATION_ALERT_ID,
         "event": event,
         "severity": "Extreme" if level == "critical" else "Severe",
         "urgency": "Immediate",
@@ -646,9 +679,88 @@ LIGHTNING_SCENARIO_STEPS = [
     },
 ]
 
+# Multiple simultaneous alerts (v1.0 item 4): exercises the server's sort
+# order, the device's "+N more" count and level colours, and -- as a side
+# benefit -- is the first scenario that sounds the Warning tier's 2-tone
+# pattern. Alerts are listed in each step in deliberately WRONG order;
+# build_simulated_conditions() runs them through the real sort, so the
+# order the device receives is the sort under test, not hand-arranged.
+_SIM_FLOOD_ADVISORY_ID = "urn:sim:multi-flood-advisory"
+_SIM_TSTORM_WARNING_ID = "urn:sim:multi-tstorm-warning"
+_SIM_FLOOD_WATCH_ID = "urn:sim:multi-flood-watch"
+
+
+def _sim_flood_advisory(**state):
+    return _sim_alert(
+        "Flood Advisory", "advisory",
+        "Minor flooding of low-lying areas.",
+        "Flooding caused by excessive rainfall is expected in the simulated area.",
+        "Turn around, don't drown when encountering flooded roads.",
+        alert_id=_SIM_FLOOD_ADVISORY_ID, **state)
+
+
+def _sim_tstorm_warning(**state):
+    return _sim_alert(
+        "Severe Thunderstorm Warning", "warning",
+        "60 mph wind gusts and quarter size hail.",
+        "A severe thunderstorm was located over the simulated area, moving east at 25 mph.",
+        "For your protection move to an interior room on the lowest floor of a building.",
+        alert_id=_SIM_TSTORM_WARNING_ID, **state)
+
+
+def _sim_flood_watch(**state):
+    return _sim_alert(
+        "Flood Watch", "watch",
+        "Flooding caused by excessive rainfall is possible.",
+        "Additional heavy rain is possible across the simulated area tonight.",
+        "Monitor later forecasts and be alert for possible flood warnings.",
+        alert_id=_SIM_FLOOD_WATCH_ID, **state)
+
+
+_ACKED = dict(acknowledged=True, needs_alert=False, last_transition="unchanged")
+_NEW = dict(acknowledged=False, needs_alert=True, last_transition="new")
+
+MULTI_ALERT_STEPS = [
+    {
+        "description": "Advisory (acked) + NEW Severe T-storm Warning -> Warning on top, "
+                       "red, +1 more, 2-tone sounds",
+        "alerts": [_sim_flood_advisory(**_ACKED), _sim_tstorm_warning(**_NEW)],
+        "advance_on_ack": True,
+    },
+    {
+        "description": "Both acknowledged -> Warning stays on top (level order), +1 more",
+        "alerts": [_sim_flood_advisory(**_ACKED), _sim_tstorm_warning(**_ACKED)],
+        "advance_on_ack": False,
+    },
+    {
+        "description": "NEW Flood Watch arrives -> jumps above the acked Warning until "
+                       "acknowledged, amber, +2 more, one chime (silent in quiet hours)",
+        "alerts": [_sim_flood_advisory(**_ACKED), _sim_tstorm_warning(**_ACKED),
+                   _sim_flood_watch(**_NEW)],
+        "advance_on_ack": True,
+    },
+    {
+        "description": "Watch acknowledged -> Warning back on top, +2 more",
+        "alerts": [_sim_flood_advisory(**_ACKED), _sim_tstorm_warning(**_ACKED),
+                   _sim_flood_watch(**_ACKED)],
+        "advance_on_ack": False,
+    },
+    {
+        "description": "Warning expired -> Watch on top, amber, +1 more",
+        "alerts": [_sim_flood_advisory(**_ACKED), _sim_flood_watch(**_ACKED)],
+        "advance_on_ack": False,
+    },
+    {
+        "description": "All expired -- back to no active alerts",
+        "alerts": [],
+        "advance_on_ack": False,
+    },
+]
+
 SIMULATION_SCENARIOS = {
     "nws_lifecycle": NWS_LIFECYCLE_STEPS,
     "lightning": LIGHTNING_SCENARIO_STEPS,
+    "multi_alert": MULTI_ALERT_STEPS,
 }
 
 # Guarded by state_lock, same as every other piece of shared state.
@@ -685,6 +797,8 @@ def build_simulated_conditions(scenario_name, step_index):
         alert["first_seen_at"] = now_iso
         alert["last_updated_at"] = now_iso
         alerts.append(alert)
+    # Same ordering rule real alerts get -- simulation tests the real sort.
+    alerts = sort_alerts_for_device(alerts)
 
     return {
         "tempest": tempest,
@@ -936,6 +1050,9 @@ def api_conditions():
             for alert in tracked_alerts.values()
             if alert["last_transition"] != "expired"
         ]
+        # The device treats alerts[0] as THE alert (display, sound, ack)
+        # and counts the rest as "+N more" -- see sort_alerts_for_device.
+        alerts_copy = sort_alerts_for_device(alerts_copy)
 
         # Simulation must NEVER mask a real active alert. The real UDP
         # listener and NWS poller keep running the whole time simulation
@@ -1000,7 +1117,9 @@ def api_ack_alert():
             scenario = SIMULATION_SCENARIOS[simulation_state["scenario"]]
             step = scenario[simulation_state["step"]]
             step_alerts = step.get("alerts", [])
-            if not step_alerts or step_alerts[0]["id"] != alert_id:
+            # Any alert in the current step can be acknowledged (a step
+            # may hold several since the multi_alert scenario).
+            if alert_id not in {a["id"] for a in step_alerts}:
                 return jsonify({"error": "unknown alert id"}), 404
             if step.get("advance_on_ack") and simulation_state["step"] + 1 < len(scenario):
                 simulation_state["step"] += 1

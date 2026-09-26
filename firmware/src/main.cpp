@@ -262,6 +262,11 @@ static uint16_t COLOR_BG, COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY, COLOR_TEXT_D
     COLOR_SEPARATOR, COLOR_NWS_CLEAR_DOT, COLOR_NWS_CLEAR_TEXT,
     COLOR_LIGHTNING_BG, COLOR_LIGHTNING_BORDER, COLOR_LIGHTNING_TEXT,
     COLOR_WARNING_BG, COLOR_WARNING_TEXT_HEADLINE, COLOR_WARNING_TEXT_DETAIL,
+    // Amber tier for lower-level NWS alerts (Watch/Advisory/Statement),
+    // approved by Dan in Session 12 -- red is reserved for Warning and
+    // Critical. A SOLID, flat bar, so it stays distinct in shape from
+    // lightning's outlined, rounded amber box even when both are shown.
+    COLOR_ALERT_AMBER_BG, COLOR_ALERT_AMBER_HEADLINE, COLOR_ALERT_AMBER_DETAIL,
     COLOR_LABEL, COLOR_STATUS_BAD,
     // Feels-like temperature bands (Session 9). Cold colors and the
     // orange band are new; yellow/amber reuses the lightning color and
@@ -293,6 +298,9 @@ void initColors() {
   COLOR_WARNING_BG       = M5.Display.color565(0x5c, 0x0e, 0x0e);
   COLOR_WARNING_TEXT_HEADLINE = M5.Display.color565(0xff, 0xb3, 0xb3);
   COLOR_WARNING_TEXT_DETAIL   = M5.Display.color565(0xe0, 0x8a, 0x8a);
+  COLOR_ALERT_AMBER_BG        = M5.Display.color565(0x4a, 0x33, 0x00);
+  COLOR_ALERT_AMBER_HEADLINE  = M5.Display.color565(0xff, 0xd6, 0x80);
+  COLOR_ALERT_AMBER_DETAIL    = M5.Display.color565(0xd9, 0xb0, 0x60);
   COLOR_LABEL             = M5.Display.color565(0x6a, 0x6a, 0x6a);
   COLOR_STATUS_BAD        = M5.Display.color565(0xcc, 0x33, 0x33);
   COLOR_FEELS_COLD        = M5.Display.color565(0x5a, 0x9a, 0xe0);
@@ -381,6 +389,49 @@ int eventTextSize(const String &text, int maxWidth) {
   return ((int)text.length() * GLYPH_W_SIZE2 <= maxWidth) ? 2 : 1;
 }
 
+// ---- Alert priority and severity treatment (v1.0 item 4, Session 12) ----
+// The server sorts nws.alerts so alerts[0] is the one to show, sound and
+// acknowledge (a sounding alert that still needs acknowledgement first,
+// then highest level). Firmware adds only colour-by-level and a
+// "+N more" count; it never re-sorts.
+
+const int GLYPH_W_SIZE1 = 6;
+
+struct AlertColors {
+  uint16_t bg, headline, detail;
+};
+
+// Red for Warning and Critical; amber for Watch, Advisory and
+// Informational (Special Weather Statements). A blank or unrecognised
+// level falls back to RED -- if the level is ever missing, fail toward
+// the more conspicuous treatment, never toward a calmer one.
+AlertColors alertColorsForLevel(const String &level) {
+  if (level == "watch" || level == "advisory" || level == "informational") {
+    return {COLOR_ALERT_AMBER_BG, COLOR_ALERT_AMBER_HEADLINE, COLOR_ALERT_AMBER_DETAIL};
+  }
+  return {COLOR_WARNING_BG, COLOR_WARNING_TEXT_HEADLINE, COLOR_WARNING_TEXT_DETAIL};
+}
+
+AlertColors currentAlertColors() {
+  return alertColorsForLevel(nwsFirstAlertLevel);
+}
+
+// How many active alerts are NOT the one on screen.
+int nwsMoreCount() {
+  return nwsAlertCount > 1 ? nwsAlertCount - 1 : 0;
+}
+
+String nwsMoreText() {
+  return "+" + String(nwsMoreCount()) + " more";
+}
+
+// Cuts text to maxChars, ending in ".." if anything was removed.
+String fitChars(const String &text, int maxChars) {
+  if ((int)text.length() <= maxChars) return text;
+  if (maxChars <= 2) return text.substring(0, maxChars);
+  return text.substring(0, maxChars - 2) + "..";
+}
+
 void drawNwsFooterClear() {
   M5.Display.drawFastHLine(0, 194, 320, COLOR_SEPARATOR);
   M5.Display.fillCircle(20, 212, 4, COLOR_NWS_CLEAR_DOT);
@@ -406,16 +457,26 @@ const int NOW_FOOTER_Y = 196;
 const int NOW_FOOTER_H = 44;
 
 void drawNwsWarningFooter(const String &eventText, const String &untilText) {
-  M5.Display.fillRect(0, NOW_FOOTER_Y, 320, NOW_FOOTER_H, COLOR_WARNING_BG);
+  AlertColors c = currentAlertColors();
+  M5.Display.fillRect(0, NOW_FOOTER_Y, 320, NOW_FOOTER_H, c.bg);
   M5.Display.setTextDatum(top_left);
-  M5.Display.setTextColor(COLOR_WARNING_TEXT_HEADLINE, COLOR_WARNING_BG);
+  M5.Display.setTextColor(c.headline, c.bg);
   String eventName = shortenEventName(eventText);
   int eventSize = eventTextSize(eventName, 300);   // x = 16 .. 316
   M5.Display.setTextSize(eventSize);
   M5.Display.drawString(eventName, 16, eventSize == 2 ? 202 : 206);
   M5.Display.setTextSize(1);
-  M5.Display.setTextColor(COLOR_WARNING_TEXT_DETAIL, COLOR_WARNING_BG);
+  M5.Display.setTextColor(c.detail, c.bg);
   M5.Display.drawString(untilText, 16, 224);
+  if (nwsMoreCount() > 0) {
+    // Right-aligned on the "Until" line. The longest until text
+    // ("Until Wed 12:30 PM -- status not current", 40 chars) ends at
+    // x=256, clear of a one-digit "+N more" (262..304).
+    M5.Display.setTextColor(c.headline, c.bg);
+    M5.Display.setTextDatum(top_right);
+    M5.Display.drawString(nwsMoreText(), 304, 224);
+    M5.Display.setTextDatum(top_left);
+  }
 }
 
 void drawNwsFooterUnknown() {
@@ -618,11 +679,27 @@ void drawPersistentStrip() {
   // state too, for the same reason the Now screen and NWS Alerts page
   // both distinguish it from a genuine "clear".
   NwsView nwsView = currentNwsView();
+  bool showMore = false;
   if (nwsView == NWS_VIEW_ALERT || nwsView == NWS_VIEW_ALERT_STALE) {
-    bg = COLOR_WARNING_BG;
-    textColor = COLOR_WARNING_TEXT_HEADLINE;
+    AlertColors c = currentAlertColors();
+    bg = c.bg;
+    textColor = c.headline;
     msg = nwsFirstAlertEvent;
     if (nwsView == NWS_VIEW_ALERT_STALE) msg += " (status not current)";
+    if (nwsMoreCount() > 0) {
+      // Leave room for a right-aligned "+N more" ending at x=308: the
+      // message may use x=12..254, i.e. 40 characters at size 1. Shorten
+      // in order of least information lost.
+      showMore = true;
+      const int maxChars = (254 - 12) / GLYPH_W_SIZE1;
+      if ((int)msg.length() > maxChars) {
+        // Trim the event NAME, never the staleness marker -- "not
+        // current" is the part that must always survive.
+        String suffix = (nwsView == NWS_VIEW_ALERT_STALE) ? " (not current)" : "";
+        msg = fitChars(shortenEventName(nwsFirstAlertEvent),
+                       maxChars - (int)suffix.length()) + suffix;
+      }
+    }
   } else if (WiFi.status() != WL_CONNECTED) {
     // Checked directly against WiFi.status(), not inferred from a stale
     // fetch -- so this can say "Wi-Fi" specifically rather than the
@@ -656,6 +733,11 @@ void drawPersistentStrip() {
   M5.Display.setTextColor(textColor, bg);
   M5.Display.setTextSize(1);
   M5.Display.drawString(msg, 12, BOTTOM_BAR_Y + BOTTOM_BAR_H / 2);
+  if (showMore) {
+    M5.Display.setTextDatum(middle_right);
+    M5.Display.drawString(nwsMoreText(), 308, BOTTOM_BAR_Y + BOTTOM_BAR_H / 2);
+    M5.Display.setTextDatum(middle_left);
+  }
 }
 
 void drawAckPrompt() {
@@ -665,10 +747,12 @@ void drawAckPrompt() {
   // (redundant, since the alert's own detail is already on screen)
   // summary text. Same region as the strip so the touch handler in
   // loop() only needs one consistent rectangle to check against.
-  M5.Display.fillRect(0, BOTTOM_BAR_Y, 320, BOTTOM_BAR_H, COLOR_WARNING_BG);
+  // Same colour tier as the alert it acknowledges.
+  AlertColors c = currentAlertColors();
+  M5.Display.fillRect(0, BOTTOM_BAR_Y, 320, BOTTOM_BAR_H, c.bg);
   M5.Display.drawFastHLine(0, BOTTOM_BAR_Y, 320, COLOR_SEPARATOR);
   M5.Display.setTextDatum(middle_center);
-  M5.Display.setTextColor(COLOR_WARNING_TEXT_HEADLINE, COLOR_WARNING_BG);
+  M5.Display.setTextColor(c.headline, c.bg);
   M5.Display.setTextSize(2);
   M5.Display.drawString("TAP TO ACKNOWLEDGE", 160, BOTTOM_BAR_Y + BOTTOM_BAR_H / 2);
 }
@@ -1090,19 +1174,29 @@ void drawNwsAlertsPage() {
   // deliberately dropped in favor of more room for instruction text;
   // see project brief for the reasoning Dan approved). Now using the
   // real first active alert's event name and expiration.
-  M5.Display.fillRect(16, 48, 288, 34, COLOR_WARNING_BG);
-  M5.Display.setTextColor(COLOR_WARNING_TEXT_HEADLINE, COLOR_WARNING_BG);
+  AlertColors c = currentAlertColors();
+  M5.Display.fillRect(16, 48, 288, 34, c.bg);
+  M5.Display.setTextColor(c.headline, c.bg);
   String eventName = shortenEventName(nwsFirstAlertEvent);
   int eventSize = eventTextSize(eventName, 272);   // x = 24 .. 296, inside the 16..304 box
   M5.Display.setTextSize(eventSize);
   M5.Display.drawString(eventName, 24, eventSize == 2 ? 54 : 58);
   M5.Display.setTextSize(1);
-  M5.Display.setTextColor(COLOR_WARNING_TEXT_DETAIL, COLOR_WARNING_BG);
-  // Crude time extraction, same placeholder as elsewhere -- real
-  // relative/12-hour formatting needs NTP (a separate step).
+  M5.Display.setTextColor(c.detail, c.bg);
+  bool showMore = nwsMoreCount() > 0;
   String untilText = "Until " + formatAlertTimeNow(nwsFirstAlertExpires);
-  if (nwsView == NWS_VIEW_ALERT_STALE) untilText += "  -- status not current";
+  if (nwsView == NWS_VIEW_ALERT_STALE) {
+    // The long form runs to x=270 and would collide with "+N more"
+    // (right-aligned at 296), so use the short form when both show.
+    untilText += showMore ? "  -- not current" : "  -- status not current";
+  }
   M5.Display.drawString(untilText, 24, 72);
+  if (showMore) {
+    M5.Display.setTextColor(c.headline, c.bg);
+    M5.Display.setTextDatum(top_right);
+    M5.Display.drawString(nwsMoreText(), 296, 72);
+    M5.Display.setTextDatum(top_left);
+  }
 
   // Instruction: full official text, word-wrapped and truncated with an
   // indicator if it runs longer than the available space. Now using the
