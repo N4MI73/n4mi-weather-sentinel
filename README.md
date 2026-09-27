@@ -62,15 +62,20 @@ All of this is built and confirmed on the real device:
   acknowledged.
 - **Alert tones by severity.** Critical: three tones, repeating for up to two minutes.
   Warning: two tones. Watch: one chime. Advisories and statements are silent. A tap on
-  **TAP TO ACKNOWLEDGE** stops the sound, and the acknowledgement survives a server
-  restart — an alert never sounds again as if it were new.
+  **TAP TO ACKNOWLEDGE** stops the sound and shows **ACKNOWLEDGED** (or **NOT SENT – TAP
+  AGAIN** if the server didn't answer). The acknowledgement survives a server restart —
+  an alert never sounds again as if it were new.
 - **Alert History.** The last 24 hours of alerts, with the full text of each. Open it
   from Settings (page 5), or tap the coloured alert block on the NWS Alerts page when it
   shows "+N more >".
-- **Night mode.** The screen dims automatically overnight. Quiet hours share the same
-  schedule: Warnings and Critical alerts always sound; Watch chimes are silenced
-  overnight.
-- **Settings on the device:** volume and a test tone, a temporary one-hour mute, a
+- **Night mode.** The screen dims automatically overnight. A tap brightens it for 30
+  seconds; that first tap only wakes the screen, so a half-asleep tap can't acknowledge
+  anything by accident. A Critical alert brightens the screen by itself until it's
+  acknowledged. Quiet hours share the same schedule: Warnings and Critical alerts always
+  sound; Watch chimes are silenced overnight.
+- **Mute** lasts one hour and shows **MUTED** on the Now screen. A Critical alert still
+  sounds while muted.
+- **Settings on the device:** volume and a test tone, the mute button, a
   **Run Test Alert** button, day/night brightness, and the night schedule. (Settings
   reset to defaults on reboot for now.)
 - **An unmistakable test mode.** Simulations are served by the server and drawn with a
@@ -90,8 +95,7 @@ Every v1.0 feature is built. What remains before declaring v1.0 is a set of acce
 tests: a 72-hour continuous run, router and server outages, a power cycle with an alert
 active, and a daytime audio bench test.
 
-**Still open:** a small mute indicator on every screen (today mute shows only in
-Settings), and saving Settings across reboots.
+**Still open:** saving Settings across reboots.
 
 **After v1.0:** ambient alert-colour LEDs (an M5GO-BOTTOM3 add-on), matching alerts to
 the device's exact location rather than the whole county, and a captive portal for Wi-Fi

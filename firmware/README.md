@@ -48,12 +48,11 @@ $pio = (Get-ChildItem "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe"
   build flags. It's kept only in case a future `espressif32` platform version stops
   recognising `m5stack-cores3`. It hasn't been needed.
 
-The comment block at the top of `platformio.ini` still describes the original "Phase 0"
-test build and is out of date.
-
-Library versions aren't pinned yet (only ArduinoJson is pinned to 7.x). Pinning
-M5Unified/M5GFX to the versions from the last good build is worth doing before v1.0, so
-a future library update can't silently change behaviour.
+**Library versions are pinned exactly** to the last hardware-confirmed build: M5Unified
+0.2.22, M5GFX 0.2.29, ArduinoJson 7.4.3. A library update therefore can't silently change
+the device's behaviour. To update one, change its version in `platformio.ini`, then build,
+flash and re-run the bench tests before committing. The `espressif32` platform itself is
+not pinned yet.
 
 ## Hardware facts that shaped the code
 

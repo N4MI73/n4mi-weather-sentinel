@@ -270,6 +270,8 @@ static uint16_t COLOR_BG, COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY, COLOR_TEXT_D
     // Critical. A SOLID, flat bar, so it stays distinct in shape from
     // lightning's outlined, rounded amber box even when both are shown.
     COLOR_ALERT_AMBER_BG, COLOR_ALERT_AMBER_HEADLINE, COLOR_ALERT_AMBER_DETAIL,
+    // "ACKNOWLEDGED" confirmation (Session 13, approved mockup).
+    COLOR_ACK_OK_BG, COLOR_ACK_OK_TEXT,
     COLOR_LABEL, COLOR_STATUS_BAD,
     // Feels-like temperature bands (Session 9). Cold colors and the
     // orange band are new; yellow/amber reuses the lightning color and
@@ -304,6 +306,8 @@ void initColors() {
   COLOR_ALERT_AMBER_BG        = M5.Display.color565(0x4a, 0x33, 0x00);
   COLOR_ALERT_AMBER_HEADLINE  = M5.Display.color565(0xff, 0xd6, 0x80);
   COLOR_ALERT_AMBER_DETAIL    = M5.Display.color565(0xd9, 0xb0, 0x60);
+  COLOR_ACK_OK_BG             = M5.Display.color565(0x10, 0x3a, 0x10);
+  COLOR_ACK_OK_TEXT           = M5.Display.color565(0x8a, 0xd0, 0x8a);
   COLOR_LABEL             = M5.Display.color565(0x6a, 0x6a, 0x6a);
   COLOR_STATUS_BAD        = M5.Display.color565(0xcc, 0x33, 0x33);
   COLOR_FEELS_COLD        = M5.Display.color565(0x5a, 0x9a, 0xe0);
@@ -348,6 +352,18 @@ void drawCommonHeader(const char *timeStr, const char *ageStr) {
   M5.Display.drawString(timeStr, 16, 20);
   // Top-right, on the clock row, below the data-age text.
   drawWifiGlyph(294, 36, WiFi.status() == WL_CONNECTED);
+  // Mute must be visible, not just set (v1.0 requirement; approved
+  // mockup, Session 13): a plain word rather than an icon, so no one has
+  // to guess. Amber, like other "attention, not alarm" states. Ends at
+  // x=272, clear of the Wi-Fi glyph (x>=280) and of the longest clock
+  // text ("12:59 PM" ends at x=112).
+  if (audioMuted) {
+    M5.Display.setTextDatum(top_right);
+    M5.Display.setTextColor(COLOR_LIGHTNING_TEXT, COLOR_BG);
+    M5.Display.setTextSize(2);
+    M5.Display.drawString("MUTED", 272, 20);
+    M5.Display.setTextDatum(top_left);
+  }
 }
 
 void drawConditions(const char *tempStr, const char *feelsStr, const char *humidStr,
@@ -760,6 +776,53 @@ void drawAckPrompt() {
   M5.Display.drawString("TAP TO ACKNOWLEDGE", 160, BOTTOM_BAR_Y + BOTTOM_BAR_H / 2);
 }
 
+// Brief feedback after a tap on "TAP TO ACKNOWLEDGE" (Session 13,
+// approved mockup), drawn in the same bar: green "ACKNOWLEDGED" for 2 s
+// when the server confirmed it, or "NOT SENT - TAP AGAIN" for 3 s (in the
+// alert's own colour tier) when it didn't, after which the prompt returns.
+// Timed by millis() and cleared from loop(), never by delay().
+enum AckFeedback { ACK_FEEDBACK_NONE, ACK_FEEDBACK_OK, ACK_FEEDBACK_FAILED };
+AckFeedback ackFeedback = ACK_FEEDBACK_NONE;
+unsigned long ackFeedbackUntilMillis = 0;
+const unsigned long ACK_FEEDBACK_OK_MS = 2000;
+const unsigned long ACK_FEEDBACK_FAILED_MS = 3000;
+
+void showAckFeedback(bool ok) {
+  ackFeedback = ok ? ACK_FEEDBACK_OK : ACK_FEEDBACK_FAILED;
+  ackFeedbackUntilMillis = millis() + (ok ? ACK_FEEDBACK_OK_MS : ACK_FEEDBACK_FAILED_MS);
+}
+
+void drawAckFeedback() {
+  uint16_t bg, fg;
+  const char *msg;
+  if (ackFeedback == ACK_FEEDBACK_OK) {
+    bg = COLOR_ACK_OK_BG;
+    fg = COLOR_ACK_OK_TEXT;
+    msg = "ACKNOWLEDGED";
+  } else {
+    AlertColors c = currentAlertColors();
+    bg = c.bg;
+    fg = c.headline;
+    msg = "NOT SENT - TAP AGAIN";   // 20 chars = 240 px at size 2
+  }
+  M5.Display.fillRect(0, BOTTOM_BAR_Y, 320, BOTTOM_BAR_H, bg);
+  M5.Display.drawFastHLine(0, BOTTOM_BAR_Y, 320, COLOR_SEPARATOR);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(fg, bg);
+  M5.Display.setTextSize(2);
+  M5.Display.drawString(msg, 160, BOTTOM_BAR_Y + BOTTOM_BAR_H / 2);
+  M5.Display.setTextDatum(top_left);
+}
+
+// Called every loop() pass: when the feedback's time is up, clear it and
+// redraw the NWS page so the strip (or the prompt again) comes back.
+void handleAckFeedbackExpiry() {
+  if (ackFeedback == ACK_FEEDBACK_NONE) return;
+  if ((long)(millis() - ackFeedbackUntilMillis) < 0) return;
+  ackFeedback = ACK_FEEDBACK_NONE;
+  if (currentPage == PAGE_NWS_ALERTS) renderPage(currentPage);
+}
+
 // ---- Secondary pages: real content, matching approved mockups ----
 // Settings has no approved mockup yet, so it stays a placeholder.
 
@@ -1016,7 +1079,13 @@ int wrapInstructionText(const String &text, String outLines[], int maxLines,
     String &lastLine = outLines[lineCount - 1];
     int maxLastLineLen = charsPerLine - 4;
     if ((int)lastLine.length() > maxLastLineLen) {
-      lastLine = lastLine.substring(0, maxLastLineLen);
+      // Cut at the last space that fits, not mid-word ("...move to t ..."
+      // was seen in Session 13 renders). A single very long word falls
+      // back to a hard cut.
+      String cut = lastLine.substring(0, maxLastLineLen);
+      int lastSpace = cut.lastIndexOf(' ');
+      if (lastSpace > 0) cut = cut.substring(0, lastSpace);
+      lastLine = cut;
     }
     lastLine += " ...";
   }
@@ -1889,6 +1958,10 @@ void renderPageInner(Page p) {
       break;
     case PAGE_NWS_ALERTS:
       drawNwsAlertsPage();
+      if (ackFeedback != ACK_FEEDBACK_NONE) {
+        drawAckFeedback();   // takes the bar for its 2-3 seconds
+        return;
+      }
       if (nwsFirstAlertNeedsAlert) {
         drawAckPrompt();
         return;  // replaces the normal strip only while there's
@@ -2036,7 +2109,9 @@ void stepScheduleTime(int &hour, int &minute, int direction) {
 void applyCurrentBrightnessImmediately() {
   if (lastAppliedBrightnessMode == 1) {
     M5.Display.setBrightness(NIGHT_BRIGHTNESS);
-  } else if (lastAppliedBrightnessMode == 0) {
+  } else if (lastAppliedBrightnessMode == 0 || lastAppliedBrightnessMode == 2) {
+    // 2 = night, temporarily woken (Critical alert or a tap) -- see
+    // handleNightDimming().
     M5.Display.setBrightness(DAY_BRIGHTNESS);
   }
   // mode == -1 (not yet established) is left alone; handleNightDimming()
@@ -2191,6 +2266,8 @@ void handleMuteExpiry() {
   if (audioMuted && millis() >= muteUntilMillis) {
     audioMuted = false;
     Serial.println("[settings] Mute expired -- audio re-enabled");
+    // Take "MUTED" off the Now screen now, not at the next 60 s refresh.
+    if (currentPage == PAGE_NOW) renderPage(currentPage);
   }
 }
 
@@ -2242,7 +2319,11 @@ void handleAlarm() {
   // Mute and quiet hours PAUSE ticking rather than ending the episode --
   // unmuting (or morning arriving) resumes from exactly where it left
   // off, rather than losing an unacknowledged alarm to a temporary mute.
-  if (audioMuted || shouldSuppressForQuietHours(alarmEpisodeLevel)) return;
+  // Mute silences everything EXCEPT Critical (Dan, Session 13) -- the
+  // same rule quiet hours already follow. Mute itself stays on for every
+  // other level.
+  bool mutedForThisLevel = audioMuted && alarmEpisodeLevel != "critical";
+  if (mutedForThisLevel || shouldSuppressForQuietHours(alarmEpisodeLevel)) return;
 
   unsigned long now = millis();
   if (now < alarmNextActionAtMillis) return;
@@ -2305,13 +2386,57 @@ bool isNightTimeNow() {
 // Called every loop() pass but only writes to the display hardware when
 // the day/night mode actually changes -- an I2C write on every ~10ms
 // loop iteration would be pointless and wasteful when nothing changed.
+// ---- Night wake (Session 13) ----
+// At night the screen is temporarily raised to DAY brightness in two
+// cases, and drops back to night brightness on its own afterwards:
+//  - a Critical alert that still needs acknowledgement (Dan: Critical
+//    only, not Warnings) -- until it is acknowledged or ends;
+//  - a tap on the dimmed screen -- for NIGHT_TAP_WAKE_MS after the last
+//    touch. That waking tap is swallowed (does nothing else), so a
+//    half-asleep tap can't advance a page or acknowledge an alert.
+// Not on the Settings brightness page, where the person is judging the
+// night level itself and needs to see it.
+const unsigned long NIGHT_TAP_WAKE_MS = 30000;
+unsigned long nightTapWakeUntilMillis = 0;
+bool nightTapWakeActive = false;
+
+bool criticalNeedsWake() {
+  return nwsAlertCount > 0 && nwsFirstAlertLevel == "critical" && nwsFirstAlertNeedsAlert;
+}
+
+bool tapWakeAllowedHere() {
+  return !(currentPage == PAGE_SETTINGS && settingsSubPage == 2);
+}
+
+void handleNightDimming();   // defined just below
+
+// Called on every new touch. Returns true if this touch only woke the
+// screen and must not be acted on.
+bool nightWakeOnTouch() {
+  if (!isNightTimeNow() || !tapWakeAllowedHere()) return false;
+  bool wasDim = (lastAppliedBrightnessMode == 1);
+  nightTapWakeActive = true;
+  nightTapWakeUntilMillis = millis() + NIGHT_TAP_WAKE_MS;   // every touch extends it
+  if (wasDim) {
+    handleNightDimming();   // brighten now, not on the next loop pass
+    Serial.println("[brightness] tap woke the dimmed screen (touch swallowed)");
+  }
+  return wasDim;
+}
+
 void handleNightDimming() {
   bool night = isNightTimeNow();
-  int mode = night ? 1 : 0;
+  if (nightTapWakeActive && (!tapWakeAllowedHere() ||
+                             (long)(millis() - nightTapWakeUntilMillis) >= 0)) {
+    nightTapWakeActive = false;
+  }
+  bool woken = night && (criticalNeedsWake() || nightTapWakeActive);
+  int mode = night ? (woken ? 2 : 1) : 0;   // 0 day, 1 night, 2 night-but-woken
   if (mode == lastAppliedBrightnessMode) return;
-  uint8_t level = night ? NIGHT_BRIGHTNESS : DAY_BRIGHTNESS;
+  uint8_t level = (mode == 1) ? NIGHT_BRIGHTNESS : DAY_BRIGHTNESS;
   M5.Display.setBrightness(level);
-  Serial.printf("[brightness] switched to %s (raw %d)\n", night ? "NIGHT" : "DAY", level);
+  Serial.printf("[brightness] switched to %s (raw %d)\n",
+                mode == 0 ? "DAY" : (mode == 1 ? "NIGHT" : "NIGHT-WOKEN"), level);
   lastAppliedBrightnessMode = mode;
 }
 
@@ -2761,10 +2886,10 @@ void fetchAlertHistory() {
 // fetchConditions() above, but user-triggered rather than on a 60s
 // timer, so the impact is a single brief pause on tap rather than a
 // recurring background one.
-void ackAlert(const String &alertId) {
+bool ackAlert(const String &alertId) {
   if (WiFi.status() != WL_CONNECTED || alertId.length() == 0) {
     Serial.println("[ack] Skipped -- no Wi-Fi or no alert id");
-    return;
+    return false;
   }
 
   Serial.printf("[ack] Acknowledging alert %s... (t=%lu ms)\n", alertId.c_str(), millis());
@@ -2795,6 +2920,7 @@ void ackAlert(const String &alertId) {
                   httpCode, HTTPClient::errorToString(httpCode).c_str());
   }
   http.end();
+  return httpCode == 200;
 }
 
 // "RUN TEST ALERT" (Settings, Mute page). Same POST pattern as
@@ -2863,6 +2989,13 @@ void loop() {
   if (touch.wasPressed()) {
     touchStartTime = millis();
     longPressHandled = false;
+    // Night: a tap on the dimmed screen only wakes it (Session 13).
+    // Marking the touch "handled" blocks both the tap and the long-press
+    // branches below for this one touch.
+    if (nightWakeOnTouch()) {
+      longPressHandled = true;
+      lastActivityTime = millis();
+    }
     Serial.printf("[touch] press x=%d y=%d t=%lu page=%d\n",
                   (int)touch.x, (int)touch.y, millis(), (int)currentPage);
   }
@@ -2916,8 +3049,8 @@ void loop() {
                              touch.y >= NWS_HEADER_Y && touch.y < NWS_HEADER_Y + NWS_HEADER_H);
 
     if (tappedAckPrompt) {
-      ackAlert(nwsFirstAlertId);
-      renderPage(currentPage);  // redraw -- prompt disappears if the ack succeeded
+      showAckFeedback(ackAlert(nwsFirstAlertId));
+      renderPage(currentPage);  // shows ACKNOWLEDGED / NOT SENT in the bar
     } else if (tappedMoreAlerts) {
       Serial.println("Tap on '+N more' -- opening Alert History");
       currentPage = PAGE_SETTINGS;
@@ -2941,6 +3074,7 @@ void loop() {
   handleWifiAndNtpReconnect();
   handleNightDimming();
   handleMuteExpiry();
+  handleAckFeedbackExpiry();
   handleAlarm();
 
   // Idle auto-return to Now
