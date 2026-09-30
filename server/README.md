@@ -12,6 +12,19 @@ A small, always-on Python/Flask service that the bedside device polls:
   for the device's Alert History page.
 - It serves everything as compact JSON on **port 8085**.
 
+## Requirements
+
+- **Same local network as the Tempest hub.** The hub broadcasts its data on the local
+  network, and that broadcast doesn't cross routers or separate VLANs, so the machine
+  running this server must be on the same network segment as the hub.
+- **Incoming UDP on port 50222** allowed on that machine.
+- **Host networking in Docker** (see below). A container on Docker's default network never
+  hears the broadcast.
+- **Your own NWS zone.** The zone is set in the code (`NWS_ZONE_ID`, currently `GAC073`);
+  change it to your county's zone. You can look up your zone on weather.gov.
+- **No WeatherFlow account, token or cloud access** is needed. The server works entirely
+  from the hub's local broadcast.
+
 ## Deploying (NAS, Portainer)
 
 It's deployed with Portainer's **Repository** build method: Portainer builds the image
@@ -51,10 +64,12 @@ through**, e.g. `LIGHTNING_FILTER_RADIUS_MI=${LIGHTNING_FILTER_RADIUS_MI:-10}` u
 `environment:`. A missing closing brace gives Portainer's "invalid interpolation format"
 error.
 
-## Sharing the Tempest broadcast with WeeWX
+## Only if another program on the same machine hears the broadcast (e.g. WeeWX)
 
-WeeWX on the same NAS also uses host networking to receive the same broadcast. Two
-programs can share one UDP port only if **both** agree to share it:
+Skip this section if nothing else on the server's machine listens for the Tempest
+broadcast. It applies here because WeeWX runs on the same NAS, also with host networking.
+Two programs on one machine can share the broadcast's UDP port only if **both** agree to
+share it:
 
 - this server's socket sets `SO_REUSEPORT` (already in the code);
 - WeeWX's `weatherflowudp` driver needs `share_socket = True` in `weewx.conf`.
