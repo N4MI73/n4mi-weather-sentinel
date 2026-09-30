@@ -89,17 +89,29 @@ All of this is built and confirmed on the real device:
   its clock, and refreshes immediately once it reconnects, with a reboot only as a last
   resort after 10 minutes of continuous failure.
 
-## Road to v1.0 and beyond
+## Status: v1.0 (September 2026)
 
-Every v1.0 feature is built. What remains before declaring v1.0 is a set of acceptance
-tests: a 72-hour continuous run, router and server outages, a power cycle with an alert
-active, and a daytime audio bench test.
+Version 1.0 passed its acceptance tests on the real device:
+- a 72-hour continuous run, with night dimming switching on schedule every night;
+- router off and on, and the server stopped and restarted — every screen showed the
+  right "unknown" or "unreachable" state and recovered by itself in under a minute;
+- a power cycle with an alert active (it came back without sounding again);
+- a full audio bench test (every tone, mute, quiet hours) and simulations of single and
+  multiple alerts.
 
-**Still open:** saving Settings across reboots.
+The Status page shows the firmware version, and the matching commit is tagged `v1.0`.
 
-**After v1.0:** ambient alert-colour LEDs (an M5GO-BOTTOM3 add-on), matching alerts to
-the device's exact location rather than the whole county, and a captive portal for Wi-Fi
-setup (replacing the header-file approach below).
+**Planned after v1.0:**
+- **Ambient alert LEDs** (an M5GO-BOTTOM3 base) that signal alerts day and night,
+  most importantly at night, when the screen is dim and Watch chimes are silenced.
+- **Battery-backed outage signalling:** the base's battery keeps the device and LEDs
+  running when wall power drops, so an outage shows as a clear signal instead of a
+  dark device. It warns on low battery and shuts down cleanly, then restarts by itself
+  when power returns.
+- **Settings saved across reboots**, running the whole bench test from the device, and
+  an adjustable lightning distance.
+- Matching alerts to the device's exact location rather than the whole county, and a
+  captive portal for Wi-Fi setup (replacing the header-file approach below).
 
 ## Repo layout
 

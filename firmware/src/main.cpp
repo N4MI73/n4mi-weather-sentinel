@@ -22,6 +22,11 @@
 #include <time.h>
 #include "wifi_credentials.h"
 
+// Shown on the Status page. Bump this with every flashed release, and tag
+// the matching commit in GitHub with the same name (v1.0 = the build that
+// passed the Session 13-14 acceptance tests, 2026-09-30).
+const char *FIRMWARE_VERSION = "v1.0";
+
 // Forward declaration: formatCurrentTime() is defined later (grouped with
 // the rest of the NTP code, near connectWiFi()), but drawNowPage() above
 // that point needs to call it.
@@ -1398,7 +1403,7 @@ void drawStatusPage() {
   M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
   M5.Display.setTextSize(2);
   M5.Display.drawString(formatUptimeString(), 16, y + 16);
-  M5.Display.drawString("v0.1.0-dev", 170, y + 16);
+  M5.Display.drawString(FIRMWARE_VERSION, 170, y + 16);
 }
 
 // ---- Settings: 4-page shell (approved mockup, Session 10) ----
