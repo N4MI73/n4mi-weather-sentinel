@@ -15,6 +15,7 @@
 // Dan approved rather than placeholders.
 
 #include <M5Unified.h>
+#include <utility/led/LED_Strip_Class.hpp>  // M5GO Bottom3 LEDs (Session 15)
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -25,7 +26,7 @@
 // Shown on the Status page. Bump this with every flashed release, and tag
 // the matching commit in GitHub with the same name (v1.0 = the build that
 // passed the Session 13-14 acceptance tests, 2026-09-30).
-const char *FIRMWARE_VERSION = "v1.0";
+const char *FIRMWARE_VERSION = "v1.1 beta";  // LEDs + power loss (Session 15); "v1.1" once bench-tested
 
 // Forward declaration: formatCurrentTime() is defined later (grouped with
 // the rest of the NTP code, near connectWiFi()), but drawNowPage() above
@@ -53,6 +54,11 @@ void toggleMute();
 void playTestTone();
 void startRunTestAlertScenario();
 String formatMuteUntil();
+
+// Power loss and LEDs (Session 15): defined near the end of the file.
+extern bool onBatteryPower;
+bool powerScreenShouldShow();
+void drawPowerLostPage();
 
 // Alert History (Session 12): the fetch lives with the other HTTP code.
 void fetchAlertHistory();
@@ -1953,6 +1959,13 @@ void handleSettingsTouch(int x, int y) {
 void renderPageInner(Page p) {
   switch (p) {
     case PAGE_NOW:
+      // On battery with no NWS alert in effect, the POWER LOST screen
+      // stands in for Now (Session 15). An alert keeps the normal Now
+      // screen, since alerts outrank the power screen.
+      if (powerScreenShouldShow()) {
+        drawPowerLostPage();
+        return;
+      }
       drawNowPage();
       return;  // Now keeps its own full footer; no persistent strip added
     case PAGE_WIND_RAIN:
@@ -2570,7 +2583,11 @@ void handleWifiAndNtpReconnect() {
   }
 
   unsigned long downFor = now - wifiDownSinceMillis;
-  if (downFor >= WIFI_REBOOT_AFTER_MS) {
+  // Not while on battery (Session 15): in a power cut the router is down
+  // too, and a reboot would cost the clock (no NTP to get it back), reset
+  // the on-battery timer and re-sound the power-loss chime every 10
+  // minutes. The 10 minutes restart counting when wall power returns.
+  if (downFor >= WIFI_REBOOT_AFTER_MS && !onBatteryPower) {
     // Last resort: 10 minutes of continuous failure. A stuck Wi-Fi
     // driver/radio state is what this guards against -- a genuine
     // router/NAS outage will still be down after the reboot too, and
@@ -2957,12 +2974,346 @@ void startRunTestAlertScenario() {
   // that needs to feel instantaneous.
 }
 
+// ---- Power loss and M5GO Bottom3 LEDs (post-v1.0 item 1, Session 15) ----
+//
+// Hardware facts, each confirmed on Dan's unit with the diagnostic sketch
+// (diagnostics/led_power) on 2026-10-01, not just from documentation:
+//  - 10 RGB LEDs on GPIO5 (M5-Bus pin 8), GRB order: 1-5 down the right
+//    side, 6-10 up the left. All ten always show the same thing here.
+//  - The AXP2101 power chip reads USB voltage ~5000 mV on wall power and
+//    0 within about a second of unplugging; the M5GO battery keeps the
+//    device and LEDs running and reads through the same chip.
+//  - After M5.Power.powerOff() on battery, the device starts by itself
+//    2-3 s after USB power returns -- the critical requirement.
+//  - Visible LED levels (brightest channel out of 255): 16 is the night
+//    floor with red and amber still distinct; 32-64 for daytime; 128-255
+//    for urgent daytime.
+// M5.Led.setBrightness() is left at 255 (no scaling): its own curve
+// wipes out the smaller colour channel at low settings, so amber turns
+// red. Colours are scaled here instead, keeping every lit channel >= 1.
+//
+// LED meaning (approved by Dan, Session 15). Off = all clear.
+//   Unacknowledged Warning/Critical  red bursts, 3 (Critical) / 2 flashes
+//   Unacknowledged Watch             amber, 1 flash per burst
+//   On battery (power lost)          slow blue blink
+//   Alert in effect, nothing needed  steady dim glow in its colour
+//     (acknowledged, or an Advisory/Statement that never sounds)
+//   Lightning within the radius      white double flicker every 10 s
+//   Status unknown                   steady dim blue (NWS or lightning
+//                                    can't be vouched for -- never dark)
+//   Low battery                      5 fast blue flashes, then power-off
+// The first matching line wins.
+
+const int LED_DATA_PIN = 5;
+const int LED_COUNT = 10;
+
+struct LedColor { uint8_t r, g, b; };
+const LedColor LED_RED   = {255, 0, 0};
+const LedColor LED_AMBER = {255, 96, 0};
+const LedColor LED_WHITE = {255, 255, 255};
+const LedColor LED_BLUE  = {0, 0, 255};
+
+// Levels (Dan, Session 15).
+const uint8_t LED_LEVEL_NIGHT = 16;
+const uint8_t LED_LEVEL_NIGHT_CRITICAL = 64;   // unacknowledged Critical only
+const uint8_t LED_LEVEL_DAY_DIM = 32;          // steady glow / unknown
+const uint8_t LED_LEVEL_DAY = 64;
+const uint8_t LED_LEVEL_DAY_URGENT = 255;      // unacknowledged Warning/Critical
+
+bool ledsReady = false;
+
+bool setupLeds() {
+  auto bus = std::make_shared<m5::LedBus_RMT>();
+  auto bc = bus->getConfig();
+  bc.pin_data = LED_DATA_PIN;
+  bus->setConfig(bc);
+
+  auto strip = std::make_shared<m5::LED_Strip_Class>();
+  auto sc = strip->getConfig();
+  sc.led_count = LED_COUNT;
+  sc.byte_per_led = 3;
+  strip->setConfig(sc);
+  strip->setBus(bus);
+
+  M5.Led.setLedInstance(strip);
+  M5.Led.setAutoDisplay(false);
+  bool ok = M5.Led.begin();
+  M5.Led.setBrightness(255);   // no library scaling -- see above
+  Serial.printf("[led] M5GO LEDs %s\n", ok ? "ready" : "FAILED to start");
+  return ok;
+}
+
+uint8_t ledScale(uint8_t c, uint8_t level) {
+  if (c == 0) return 0;
+  uint32_t v = (uint32_t)c * level / 255;
+  return v == 0 ? 1 : (uint8_t)v;
+}
+
+// Sends to the LEDs only when the output actually changes.
+void writeLeds(const LedColor &c, uint8_t level, bool on) {
+  static int lastR = -1, lastG = -1, lastB = -1;
+  uint8_t r = on ? ledScale(c.r, level) : 0;
+  uint8_t g = on ? ledScale(c.g, level) : 0;
+  uint8_t b = on ? ledScale(c.b, level) : 0;
+  if (r == lastR && g == lastG && b == lastB) return;
+  lastR = r; lastG = g; lastB = b;
+  for (int i = 0; i < LED_COUNT; i++) M5.Led.setColor(i, r, g, b);
+  M5.Led.display();
+}
+
+// Repeating bursts of `flashes` flashes (200 ms on, 200 ms off), one
+// burst every 3 s -- the same 3/2/1 count as the tones.
+bool ledBurstOn(unsigned long now, int flashes) {
+  unsigned long t = now % 3000;
+  return t < (unsigned long)flashes * 400 && (t % 400) < 200;
+}
+
+// Two quick flickers every 10 s, like a strike.
+bool ledFlickerOn(unsigned long now) {
+  unsigned long t = now % 10000;
+  return t < 80 || (t >= 200 && t < 280);
+}
+
+bool onBatteryPower = false;
+
+// Called every loop() pass; cheap, and only touches the LEDs on a change.
+// Blocking network calls (at most ~5 s) pause a flash pattern but never
+// change what it means.
+void handleLeds() {
+  if (!ledsReady) return;
+  unsigned long now = millis();
+  bool night = isNightTimeNow();
+  NwsView v = currentNwsView();
+  bool alertShown = (v == NWS_VIEW_ALERT || v == NWS_VIEW_ALERT_STALE);
+  const String &lvl = nwsFirstAlertLevel;
+  bool redTier = !(lvl == "watch" || lvl == "advisory" || lvl == "informational");  // blank -> red, as on screen
+  bool sounding = (lvl == "critical" || lvl == "warning" || lvl == "watch");
+
+  if (alertShown && nwsFirstAlertNeedsAlert && sounding) {
+    bool critical = (lvl == "critical");
+    int flashes = critical ? 3 : (lvl == "warning" ? 2 : 1);
+    uint8_t level = night ? (critical ? LED_LEVEL_NIGHT_CRITICAL : LED_LEVEL_NIGHT)
+                          : (redTier ? LED_LEVEL_DAY_URGENT : LED_LEVEL_DAY);
+    writeLeds(redTier ? LED_RED : LED_AMBER, level, ledBurstOn(now, flashes));
+  } else if (onBatteryPower) {
+    writeLeds(LED_BLUE, night ? LED_LEVEL_NIGHT : LED_LEVEL_DAY, (now % 3000) < 1000);
+  } else if (alertShown) {
+    writeLeds(redTier ? LED_RED : LED_AMBER, night ? LED_LEVEL_NIGHT : LED_LEVEL_DAY_DIM, true);
+  } else if (currentLightningView() == LIGHTNING_ACTIVE) {
+    writeLeds(LED_WHITE, night ? LED_LEVEL_NIGHT : LED_LEVEL_DAY, ledFlickerOn(now));
+  } else if (v == NWS_VIEW_UNKNOWN || currentLightningView() == LIGHTNING_UNKNOWN) {
+    writeLeds(LED_BLUE, night ? LED_LEVEL_NIGHT : LED_LEVEL_DAY_DIM, true);
+  } else {
+    writeLeds(LED_BLUE, 0, false);   // all clear: off
+  }
+}
+
+// ---- Power state ----
+// USB (wall) power is judged from the power chip's VBUS reading, sampled
+// once a second; two readings in a row are needed to change state, so a
+// single odd reading can't trigger anything. -1 (reading not supported)
+// counts as wall power, so it can never raise a false alarm.
+const int16_t WALL_POWER_MV = 4000;
+const unsigned long POWER_SAMPLE_MS = 1000;
+const int POWER_CHANGE_SAMPLES = 2;
+// PROVISIONAL until the battery run-down test: shut down cleanly when the
+// battery stays below this for LOW_BATTERY_SAMPLES readings in a row
+// (10 s, so a brief dip while Wi-Fi transmits or a tone plays doesn't
+// count). Judged by voltage, not the chip's %, which read 100% on battery
+// at 4147 mV in the diagnostic.
+const int16_t LOW_BATTERY_MV = 3500;
+const int LOW_BATTERY_SAMPLES = 10;
+const int POWER_CHIME_CHANNEL = 1;   // separate from the alarm's channel 0
+
+unsigned long batteryStartMillis = 0;
+int16_t batteryMv = -1;
+unsigned long lastPowerSampleMillis = 0;
+int powerChangeCount = 0;
+int lowBatteryCount = 0;
+int powerScreenShownMinute = -1;   // redraw the power screen when this changes
+
+bool powerScreenShouldShow() {
+  if (!onBatteryPower) return false;
+  NwsView v = currentNwsView();
+  return !(v == NWS_VIEW_ALERT || v == NWS_VIEW_ALERT_STALE);
+}
+
+// The approved Session 15 mockup (A: alerts unavailable; B: network
+// still up, alerts still arriving). B only when the NWS check is current.
+void drawPowerLostPage() {
+  const uint16_t BLUE_BG = M5.Display.color565(0x0a, 0x24, 0x50);
+  const uint16_t BLUE_HEAD = M5.Display.color565(0xb3, 0xd1, 0xff);
+  M5.Display.fillScreen(COLOR_BG);
+  M5.Display.fillRect(0, 0, 320, 44, BLUE_BG);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(BLUE_HEAD, BLUE_BG);
+  M5.Display.setTextSize(3);
+  M5.Display.drawString("POWER LOST", 160, 22);
+
+  unsigned long mins = (millis() - batteryStartMillis) / 60000;
+  powerScreenShownMinute = (int)mins;
+  char buf[24];
+  snprintf(buf, sizeof(buf), "On battery %lu:%02lu", mins / 60, mins % 60);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(COLOR_TEXT_PRIMARY, COLOR_BG);
+  M5.Display.drawString(buf, 16, 54);
+  if (batteryMv > 0) {
+    snprintf(buf, sizeof(buf), "%.2f V", batteryMv / 1000.0f);
+    M5.Display.setTextDatum(top_right);
+    M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
+    M5.Display.drawString(buf, 304, 54);
+    M5.Display.setTextDatum(top_left);
+  }
+  M5.Display.drawFastHLine(16, 78, 288, COLOR_SEPARATOR);
+
+  bool alertsArriving = (currentNwsView() == NWS_VIEW_CLEAR);
+  M5.Display.setTextColor(COLOR_TEXT_PRIMARY, COLOR_BG);
+  M5.Display.drawString(alertsArriving ? "Alerts still arriving," : "Weather alerts are", 16, 88);
+  M5.Display.drawString(alertsArriving ? "but may stop." : "UNAVAILABLE.", 16, 110);
+  M5.Display.setTextColor(BLUE_HEAD, COLOR_BG);
+  M5.Display.drawString(alertsArriving ? "Keep NOAA radio or" : "Use NOAA radio or", 16, 140);
+  M5.Display.drawString(alertsArriving ? "phone alerts handy." : "phone alerts.", 16, 162);
+  M5.Display.drawFastHLine(16, 188, 288, COLOR_SEPARATOR);
+
+  M5.Display.setTextSize(1);
+  const char *status;
+  uint16_t statusColor = COLOR_WARNING_TEXT_DETAIL;
+  if (!backendDataFresh()) status = "Server unreachable";
+  else if (!nwsAvailable) status = "NWS unavailable";
+  else { status = "Server connected"; statusColor = COLOR_NWS_CLEAR_TEXT; }
+  M5.Display.setTextColor(statusColor, COLOR_BG);
+  M5.Display.drawString(status, 16, 196);
+  M5.Display.setTextColor(COLOR_LABEL, COLOR_BG);
+  M5.Display.drawString("Shuts down safely when the battery is low.", 16, 210);
+  M5.Display.drawString("Restarts by itself when power returns.", 16, 222);
+}
+
+// One short falling two-note chime. Plays even when muted and in quiet
+// hours (Dan, Session 15): an outage means warnings may have stopped
+// reaching the device, for any reason. Non-blocking (queued notes).
+void playPowerLossChime() {
+  M5.Speaker.setVolume(alarmVolume);
+  M5.Speaker.tone(1500, 180, POWER_CHIME_CHANNEL, true);
+  M5.Speaker.tone(1100, 300, POWER_CHIME_CHANNEL, false);
+}
+
+// Screen C, the 5 blue flashes, then a clean power-off. Blocking (~3 s)
+// on purpose: nothing else matters at this point. Wall power returning
+// during it cancels the shutdown.
+void shutdownForLowBattery() {
+  Serial.printf("[power] battery low (%d mV) -- shutting down\n", batteryMv);
+  const uint16_t BLUE_HEAD = M5.Display.color565(0xb3, 0xd1, 0xff);
+  M5.Display.fillScreen(COLOR_BG);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextColor(BLUE_HEAD, COLOR_BG);
+  M5.Display.setTextSize(3);
+  M5.Display.drawString("BATTERY LOW", 160, 78);
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(COLOR_TEXT_PRIMARY, COLOR_BG);
+  M5.Display.drawString("Shutting down", 160, 116);
+  M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
+  M5.Display.drawString("Restarts by itself when", 160, 162);
+  M5.Display.drawString("power returns.", 160, 184);
+  M5.Display.setTextDatum(top_left);
+
+  uint8_t level = isNightTimeNow() ? LED_LEVEL_NIGHT : LED_LEVEL_DAY;
+  for (int i = 0; i < 5; i++) {
+    writeLeds(LED_BLUE, level, true);
+    delay(250);
+    writeLeds(LED_BLUE, level, false);
+    delay(250);
+  }
+  delay(500);
+
+  int16_t vbus = M5.Power.getVBUSVoltage();
+  if (vbus >= WALL_POWER_MV) {
+    Serial.println("[power] wall power returned during shutdown -- cancelled");
+    lowBatteryCount = 0;
+    renderPage(currentPage);
+    return;
+  }
+  Serial.println("[power] powering off");
+  delay(100);   // let the serial line flush
+  M5.Power.powerOff();
+}
+
+void enterBatteryPower(bool atBoot) {
+  onBatteryPower = true;
+  batteryStartMillis = millis();
+  lowBatteryCount = 0;
+  Serial.printf("[power] WALL POWER LOST%s -- on battery (%d mV)\n",
+                atBoot ? " (at boot)" : "", batteryMv);
+  if (atBoot) return;   // setup() draws the first screen itself
+  playPowerLossChime();
+  // The power screen (or an alert, which outranks it) takes over.
+  currentPage = PAGE_NOW;
+  lastActivityTime = millis();
+  renderPage(currentPage);
+}
+
+void leaveBatteryPower() {
+  onBatteryPower = false;
+  Serial.printf("[power] WALL POWER BACK after %lu s on battery\n",
+                (millis() - batteryStartMillis) / 1000);
+  // Give the router the full 10 minutes from now before the Wi-Fi
+  // last-resort reboot can fire (see handleWifiAndNtpReconnect()).
+  if (!wifiWasConnected) wifiDownSinceMillis = millis();
+  if (currentPage == PAGE_NOW) renderPage(currentPage);
+}
+
+// Called every loop() pass; samples once a second.
+void handlePower() {
+  unsigned long now = millis();
+  if (now - lastPowerSampleMillis < POWER_SAMPLE_MS) return;
+  lastPowerSampleMillis = now;
+
+  int16_t vbus = M5.Power.getVBUSVoltage();
+  batteryMv = M5.Power.getBatteryVoltage();
+  bool wallNow = (vbus < 0) || (vbus >= WALL_POWER_MV);
+
+  if (wallNow == onBatteryPower) {          // reading disagrees with the state
+    if (++powerChangeCount >= POWER_CHANGE_SAMPLES) {
+      powerChangeCount = 0;
+      if (wallNow) leaveBatteryPower(); else enterBatteryPower(false);
+    }
+  } else {
+    powerChangeCount = 0;
+  }
+
+  if (!onBatteryPower) { lowBatteryCount = 0; return; }
+
+  if (batteryMv > 0 && batteryMv < LOW_BATTERY_MV) {
+    if (++lowBatteryCount >= LOW_BATTERY_SAMPLES) shutdownForLowBattery();
+  } else {
+    lowBatteryCount = 0;
+  }
+
+  // Keep the on-battery time current (it shows whole minutes).
+  if (currentPage == PAGE_NOW && powerScreenShouldShow() &&
+      (int)((now - batteryStartMillis) / 60000) != powerScreenShownMinute) {
+    renderPage(currentPage);
+  }
+}
+
+void setupPower() {
+  ledsReady = setupLeds();
+  // Status is unknown until the first fetch: say so from the first moment.
+  if (ledsReady) writeLeds(LED_BLUE, LED_LEVEL_NIGHT, true);
+  int16_t vbus = M5.Power.getVBUSVoltage();
+  batteryMv = M5.Power.getBatteryVoltage();
+  Serial.printf("[power] at boot: USB %d mV, battery %d mV\n", vbus, batteryMv);
+  if (vbus >= 0 && vbus < WALL_POWER_MV) enterBatteryPower(true);
+  lastPowerSampleMillis = millis();
+}
+
 void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
 
   Serial.begin(115200);
   delay(200);
+  setupPower();   // LEDs show "status unknown" through the blocking Wi-Fi/NTP start
   Serial.println();
   Serial.println("=== Weather Sentinel -- Navigation demo ===");
   Serial.println("Tap to advance page. Long-press (~1s) for Settings.");
@@ -3081,6 +3432,8 @@ void loop() {
   handleMuteExpiry();
   handleAckFeedbackExpiry();
   handleAlarm();
+  handlePower();
+  handleLeds();
 
   // Idle auto-return to Now
   if (currentPage != PAGE_NOW &&

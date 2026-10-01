@@ -67,6 +67,18 @@ relied on it.
 - **Touch events:** a tap's release is `wasClicked()`; there is no `wasReleased()`.
   Coordinates are `touch_detail_t.x` / `.y`.
 - **Board identity:** the SE reports `board_M5StackCoreS3SE`, not `board_M5CoreS3`.
+- **M5GO Bottom3 LEDs:** 10 RGB LEDs on GPIO5 (M5-Bus pin 8), GRB colour order. LEDs
+  1–5 run down the right side and 6–10 up the left. They're driven by M5Unified's own
+  `LED_Strip_Class` / `LedBus_RMT`, so no extra library is needed. `M5.Led.setBrightness()`
+  is left at 255, because its curve wipes out the smaller colour channel at low levels
+  (amber turns red); colours are scaled in the code instead. Level 16 (out of 255) is the
+  dimmest level where red and amber still look different.
+- **Power loss:** the AXP2101 reads USB voltage at about 5000 mV on wall power and 0
+  within a second of unplugging. The M5GO battery reads through the same chip. After
+  `M5.Power.powerOff()` on battery, the device starts by itself 2–3 s after USB power
+  returns.
+- **Battery %** read 100% on battery at 4147 mV, so low-battery shutdown goes by voltage
+  instead. The 3.5 V threshold is provisional until a battery run-down test.
 - **Missing values in the server's data:** alert text fields are read with ArduinoJson's
   `| ""` default, so a JSON `null` never shows up on screen as the word "null".
 
@@ -84,3 +96,9 @@ relied on it.
 - **One layout for alert text.** The NWS Alerts page and the Alert History detail view
   both draw alert text through `drawAlertBody()`, so one alert can't be laid out two
   different ways.
+
+## Diagnostics
+
+`diagnostics/led_power/` (at the repo root) is a separate bench sketch for the LEDs and
+the power chip, with no Wi-Fi or server. Its README covers flashing it and its tests,
+including the battery run-down test. Flash the real firmware back afterwards.
