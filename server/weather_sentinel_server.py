@@ -55,8 +55,29 @@ import requests
 UDP_PORT = 50222
 HTTP_PORT = 8085  # matches the port reserved for this project
 
-NWS_ZONE_ID = "GAC073"  # Columbia County, GA -- confirmed independently
-                         # in Personal Portal and Storm Alert System
+DEFAULT_NWS_ZONE_ID = "GAC073"  # Columbia County, GA -- confirmed independently
+                                # in Personal Portal and Storm Alert System
+NWS_ZONE_PATTERN = re.compile(r"^[A-Z]{2}[CZ][0-9]{3}$")  # e.g. GAC073, GAZ073
+
+
+def _zone_from_env(default=DEFAULT_NWS_ZONE_ID):
+    """NWS_ZONE_ID from the environment (Portainer), so anyone building
+    the server sets their own zone without editing code (Session 15).
+    Accepts a county (GAC073) or forecast zone (GAZ073) code, any case.
+    Missing or blank means the default; anything malformed falls back to
+    the default loudly, rather than polling a zone that doesn't exist."""
+    raw = os.environ.get("NWS_ZONE_ID")
+    if raw is None or raw.strip() == "":
+        return default
+    zone = raw.strip().upper()
+    if not NWS_ZONE_PATTERN.match(zone):
+        print(f"[config] IGNORING bad NWS_ZONE_ID={raw!r} (expected like GAC073 or "
+              f"GAZ073); using {default}", flush=True)
+        return default
+    return zone
+
+
+NWS_ZONE_ID = _zone_from_env()
 NWS_CONTACT_INFO = os.environ.get(
     "NWS_CONTACT_INFO", "(n4mi-weather-sentinel, CHANGE-ME@example.com)"
 )
@@ -1316,6 +1337,8 @@ def healthz():
 
 if __name__ == "__main__":
     load_persisted_alerts()
+    print(f"[config] NWS zone = {NWS_ZONE_ID} "
+          f"(default is {DEFAULT_NWS_ZONE_ID}; set NWS_ZONE_ID to change)", flush=True)
     print(f"[config] lightning filter radius = {LIGHTNING_FILTER_RADIUS_MI:g} mi "
           f"(default is 10; set LIGHTNING_FILTER_RADIUS_MI to change)", flush=True)
 

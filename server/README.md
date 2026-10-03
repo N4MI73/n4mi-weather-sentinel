@@ -5,8 +5,8 @@ A small, always-on Python/Flask service that the bedside device polls:
 - It listens for the Tempest hub's **local UDP broadcast** on port 50222: observations
   (`obs_st`) and individual lightning strikes (`evt_strike`). There's no WeatherFlow
   cloud call and no token.
-- It polls the **NWS active-alerts API** for one zone (`GAC073`, set in the code) every
-  5 minutes.
+- It polls the **NWS active-alerts API** for one zone (`NWS_ZONE_ID`, default `GAC073`)
+  every 5 minutes.
 - It classifies alerts (Critical / Warning / Watch / Advisory / Informational), tracks
   each one by its NWS id, records acknowledgements, and keeps expired alerts for 24 hours
   for the device's Alert History page.
@@ -20,8 +20,9 @@ A small, always-on Python/Flask service that the bedside device polls:
 - **Incoming UDP on port 50222** allowed on that machine.
 - **Host networking in Docker** (see below). A container on Docker's default network never
   hears the broadcast.
-- **Your own NWS zone.** The zone is set in the code (`NWS_ZONE_ID`, currently `GAC073`);
-  change it to your county's zone. You can look up your zone on weather.gov.
+- **Your own NWS zone.** Set `NWS_ZONE_ID` in Portainer (see Environment variables) to
+  your county code (e.g. `GAC073`) or forecast-zone code (e.g. `GAZ073`). Both are listed
+  on weather.gov.
 - **No WeatherFlow account, token or cloud access** is needed. The server works entirely
   from the hub's local broadcast.
 
@@ -56,6 +57,7 @@ from this folder's `Dockerfile` instead of pulling a pre-built one.
 | Variable | Required | Meaning |
 |---|---|---|
 | `NWS_CONTACT_INFO` | yes | The identification NWS asks for: `(appname, contact@email.com)`. Set it only in Portainer; never commit a real address. |
+| `NWS_ZONE_ID` | no (default `GAC073`) | The NWS zone whose alerts are watched: a county code (`GAC073`) or forecast-zone code (`GAZ073`). A malformed value falls back to the default, and the log says so. The log shows the zone in use at startup: `[config] NWS zone = …`. |
 | `LIGHTNING_FILTER_RADIUS_MI` | no (default 10) | Lightning distance cutoff in miles. Blank or invalid values fall back to 10, and the log says so. |
 | `ALERTS_PERSISTENCE_PATH` | no (default `/data/alerts_state.json`) | Where alert state is saved. The tests use it to write to a temporary folder. |
 
@@ -135,6 +137,7 @@ Invoke-RestMethod -Method Post -Uri "$ws/stop"
 pip install flask requests
 python server\tests\test_alert_priority.py
 python server\tests\test_alert_history.py
+python server\tests\test_nws_zone.py
 ```
 
 Each file runs on its own with plain Python. They need no network, NAS or device, and

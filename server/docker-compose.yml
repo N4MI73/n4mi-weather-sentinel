@@ -36,4 +36,5 @@ services:
       - /volume2/docker/weather-sentinel/data:/data
     environment:
       - NWS_CONTACT_INFO=${NWS_CONTACT_INFO}
+      - NWS_ZONE_ID=${NWS_ZONE_ID:-GAC073}
       - LIGHTNING_FILTER_RADIUS_MI=${LIGHTNING_FILTER_RADIUS_MI:-10}
