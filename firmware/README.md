@@ -51,8 +51,16 @@ $pio = (Get-ChildItem "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe"
 **Library versions are pinned exactly** to the last hardware-confirmed build: M5Unified
 0.2.22, M5GFX 0.2.29, ArduinoJson 7.4.3. A library update therefore can't silently change
 the device's behaviour. To update one, change its version in `platformio.ini`, then build,
-flash and re-run the bench tests before committing. The `espressif32` platform itself is
-not pinned yet.
+flash and re-run the bench tests before committing.
+
+**The platform is pinned as well:** the
+[pioarduino](https://github.com/pioarduino/platform-espressif32) release `55.03.311`
+(ESP32 Arduino core 3.3.11, ESP-IDF 5.5.5), given as its download URL in both
+environments. Until 2026-10-04 the file said only `platform = espressif32`, which on the
+development PC resolved to this same pioarduino package, already installed for other
+projects. On a different PC it would have fetched the official PlatformIO platform, which
+this firmware has never been built with. Pinning the URL means every build uses the
+tested combination. `pio pkg list -d firmware` shows what a build resolves to.
 
 ## Hardware facts that shaped the code
 
