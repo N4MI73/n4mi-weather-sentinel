@@ -1,7 +1,7 @@
 # Weather Sentinel — alert bench test
 
 A repeatable check of the screens, tones and LEDs using the server's built-in
-simulations. Valid from firmware **v1.1 beta** (Session 15, 2026-10-01).
+simulations. Valid from firmware **v1.1** (2026-10-03).
 
 ## Before you start
 
@@ -157,8 +157,9 @@ Charge the battery fully first: leave the device plugged in for several hours.
 3. Plug USB back in. **The device must start by itself** within a few seconds, without a
    button press. This is the critical requirement.
 
-The time on battery shows how much runtime the shutdown threshold (3.5 V, provisional
-in v1.1 beta) leaves.
+The shutdown threshold is 3.5 V (held for 10 s). The first run-down, on 2026-10-03, gave
+about 2 hours 40 minutes on battery from a full charge (4.11 V), with BATTERY LOW at
+3.48 V and an automatic restart within seconds of power returning.
 
 ## If something isn't right
 

@@ -85,13 +85,26 @@ All of this is built and confirmed on the real device:
   check. Otherwise the device says what's wrong — Wi-Fi disconnected, server unreachable,
   NWS status unknown, or data not current — and an active alert is never hidden because
   a check failed.
+- **Alert LEDs.** Ten LEDs on the sides of the base light up for NWS alerts, red or amber,
+  flashing 3, 2 or 1 times by severity until acknowledged, then glowing steadily until the
+  alert ends. White flickers mean lightning; steady blue means the device can't vouch for
+  the weather. Off means all clear. They're dim at night, except for a Critical alert.
+- **Power-loss signalling.** If wall power drops, the base's battery keeps the device
+  running: one chime, a **POWER LOST** screen saying whether alerts are still arriving,
+  and a slow blue blink. On a low battery it warns, shuts down cleanly, and restarts by
+  itself when power returns.
 - **Self-recovery.** After a Wi-Fi drop the device retries on its own schedule, resyncs
   its clock, and refreshes immediately once it reconnects, with a reboot only as a last
   resort after 10 minutes of continuous failure.
 
-## Status: v1.0 (September 2026)
+## Status: v1.1 (October 2026)
 
-Version 1.0 passed its acceptance tests on the real device:
+**v1.1** adds the alert LEDs and power-loss signalling (the M5GO-BOTTOM3 base). It passed
+the full bench test, a night check of the LED levels, and a battery run-down test: about
+2 hours 40 minutes on battery, a clean shutdown at 3.5 V, and an automatic restart within
+seconds of power returning.
+
+**v1.0** (September 2026) passed its acceptance tests on the real device:
 - a 72-hour continuous run, with night dimming switching on schedule every night;
 - router off and on, and the server stopped and restarted — every screen showed the
   right "unknown" or "unreachable" state and recovered by itself in under a minute;
@@ -99,19 +112,14 @@ Version 1.0 passed its acceptance tests on the real device:
 - a full audio bench test (every tone, mute, quiet hours) and simulations of single and
   multiple alerts.
 
-The Status page shows the firmware version, and the matching commit is tagged `v1.0`.
+The Status page shows the firmware version, and each release's commit is tagged with the
+same name (`v1.0`, `v1.1`).
 
-**Planned after v1.0:**
-- **Ambient alert LEDs** (an M5GO-BOTTOM3 base) that signal alerts day and night,
-  most importantly at night, when the screen is dim and Watch chimes are silenced.
-- **Battery-backed outage signalling:** the base's battery keeps the device and LEDs
-  running when wall power drops, so an outage shows as a clear signal instead of a
-  dark device. It warns on low battery and shuts down cleanly, then restarts by itself
-  when power returns.
-- **Settings saved across reboots**, running the whole bench test from the device, and
-  an adjustable lightning distance.
-- Matching alerts to the device's exact location rather than the whole county, and a
-  captive portal for Wi-Fi setup (replacing the header-file approach below).
+**Planned next:**
+- **Lightning by distance:** a quieter signal for lightning 10–20 miles away, and a
+  stronger one (with the distance on screen and a short chime) inside 10 miles.
+- **v1.2, Settings:** settings saved across reboots, an LED brightness setting, running
+  the whole bench test from the device, and a Settings menu.
 
 ## Repo layout
 
@@ -120,6 +128,10 @@ n4mi-weather-sentinel/
 ├── .gitignore
 ├── README.md
 ├── images/                             (device photos used above)
+├── docs/
+│   └── bench-test.md                   (full bench test: commands and expected results)
+├── diagnostics/
+│   └── led_power/                      (hardware test sketch for the LEDs and battery)
 ├── firmware/
 │   ├── README.md                       (build, upload and hardware notes)
 │   ├── platformio.ini
@@ -134,7 +146,8 @@ n4mi-weather-sentinel/
     ├── docker-compose.yml
     └── tests/
         ├── test_alert_priority.py
-        └── test_alert_history.py
+        ├── test_alert_history.py
+        └── test_nws_zone.py
 ```
 
 ## Building the firmware
@@ -197,12 +210,17 @@ colours, "+N more" and every tone tier), and `lightning` (clear → sporadic →
 clear). Acknowledging on the device advances the steps that wait for it. The device's own
 **Run Test Alert** button starts `nws_lifecycle`.
 
+**The full bench test** — every scenario step by step, with what the screen, sound and
+LEDs should do, plus the mute, server-down, power-loss, night and battery checks — is in
+[`docs/bench-test.md`](docs/bench-test.md).
+
 ### Server tests
 
 ```powershell
 pip install flask requests
 python server\tests\test_alert_priority.py
 python server\tests\test_alert_history.py
+python server\tests\test_nws_zone.py
 ```
 
 Each test file runs on its own with plain Python and needs no network or device.

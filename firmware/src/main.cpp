@@ -26,7 +26,7 @@
 // Shown on the Status page. Bump this with every flashed release, and tag
 // the matching commit in GitHub with the same name (v1.0 = the build that
 // passed the Session 13-14 acceptance tests, 2026-09-30).
-const char *FIRMWARE_VERSION = "v1.1 beta";  // LEDs + power loss (Session 15); "v1.1" once bench-tested
+const char *FIRMWARE_VERSION = "v1.1";  // LEDs + power-loss signalling; bench, night and battery tests passed 2026-10-03
 
 // Forward declaration: formatCurrentTime() is defined later (grouped with
 // the rest of the NTP code, near connectWiFi()), but drawNowPage() above
