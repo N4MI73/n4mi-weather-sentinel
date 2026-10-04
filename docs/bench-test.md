@@ -1,7 +1,7 @@
 # Weather Sentinel — alert bench test
 
 A repeatable check of the screens, tones and LEDs using the server's built-in
-simulations. Valid from firmware **v1.1.1** (2026-10-04).
+simulations. Valid from firmware **v1.2** (2026-10-04).
 
 ## Before you start
 
@@ -14,6 +14,13 @@ simulations. Valid from firmware **v1.1.1** (2026-10-04).
 - Acknowledging on the device: go to the NWS Alerts page and tap the
   **TAP TO ACKNOWLEDGE** bar. Steps that wait for an acknowledgement advance on their
   own once you tap it.
+
+**Two ways to drive the simulations.** On the device: long-press for Settings → **TEST** →
+**ONE ALERT** (`nws_lifecycle`), **SEVERAL** (`multi_alert`) or **LIGHTNING**
+(`lightning`), then **NEXT STEP** and **END TEST**. The page shows the current step and
+updates at once after each button. Or from PowerShell, as below. Both use the same
+server endpoints, so the tables below apply either way. ("`advance`" in the tables =
+NEXT STEP.)
 
 Open PowerShell and set the address once, replacing `<nas-ip>` with the NAS address:
 
@@ -113,12 +120,12 @@ When finished: `Invoke-RestMethod -Method Post -Uri "$ws/stop"`
 
 ## 4. Mute check (optional)
 
-1. Settings → Mute page → **Mute**.
+1. Settings menu → **MUTE** (bottom left). It turns red and shows when the mute ends.
 2. Run `multi_alert` again. The Warning should stay silent while its LEDs still flash.
 3. The Now screen shows **MUTED**.
 4. Run `nws_lifecycle` to the Tornado Warning step. **Critical still sounds** even
    though muted.
-5. Tap Mute again to cancel it.
+5. Settings menu → tap the red **MUTED** bar again to cancel it.
 
 ## 5. Status unknown
 
@@ -143,19 +150,32 @@ When finished: `Invoke-RestMethod -Method Post -Uri "$ws/stop"`
 
 ## 7. Night check
 
-1. Settings → Schedule page: bring the night start forward to the current time, or test
+1. Settings → **SCHEDULE**: bring the night start forward to the current time, or test
    after 10 PM.
 2. Rerun the first two steps of `multi_alert`, then `nws_lifecycle` up to the Tornado
    Warning step.
 3. Check that:
-   - every LED state is dim (level 16);
-   - an unacknowledged Critical is noticeably brighter (level 64);
+   - every LED state is dim (the LEDs page's night level, default 16);
+   - an unacknowledged Critical is noticeably brighter (4× the night level, default 64);
    - the Watch chime is silent;
    - nothing lights up the room.
-4. Set the schedule back to 10 PM–7 AM afterwards. Settings aren't saved across a
-   restart yet, so a restart also puts it back.
+4. Set the schedule back to 10 PM–7 AM afterwards. Settings are saved (from v1.2), so a
+   restart keeps whatever you leave it at.
 
-## 8. Battery run-down (occasional)
+## 8. Settings (v1.2)
+
+1. Long-press: the **Settings menu** opens, with six tiles showing their current values,
+   and **MUTE** / **DONE** along the bottom.
+2. Each tile opens its page; **< BACK** returns to the menu and **DONE** to the Now screen.
+3. **LEDS:** tap − or + on either level. The LEDs show amber at that level for about 3
+   seconds and the page says "Showing amber at N"; then the LEDs return to normal.
+4. **Saved across a restart:** change the volume, a screen brightness, an LED level and
+   the night schedule; go back to the menu; restart the device (or unplug and replug it).
+   Every value should be as you left it, and **mute should be off**.
+5. Leave Settings alone on a page for 45 seconds: it returns to the Now screen and still
+   keeps the change.
+
+## 9. Battery run-down (occasional)
 
 Charge the battery fully first: leave the device plugged in for several hours.
 

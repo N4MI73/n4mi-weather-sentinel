@@ -75,9 +75,11 @@ All of this is built and confirmed on the real device:
   sound; Watch chimes are silenced overnight.
 - **Mute** lasts one hour and shows **MUTED** on the Now screen. A Critical alert still
   sounds while muted.
-- **Settings on the device:** volume and a test tone, the mute button, a
-  **Run Test Alert** button, day/night brightness, and the night schedule. (Settings
-  reset to defaults on reboot for now.)
+- **Settings on the device:** a long press opens a menu of six tiles: **Sound** (volume,
+  test tone), **Screen** (day/night brightness), **LEDs** (day/night LED level, with a
+  live preview), **Schedule** (night hours), **History** (last 24 hours of alerts) and
+  **Test** (run every bench-test simulation from the device). **Mute** is on the menu
+  itself. Settings are saved and survive a restart or power cut; mute never does.
 - **An unmistakable test mode.** Simulations are served by the server and drawn with a
   magenta border and a **SIMULATION** tag. A real NWS alert automatically ends any
   running simulation, so a test can never hide a real warning.
@@ -122,9 +124,8 @@ same name (`v1.0`, `v1.1`).
 
 **v1.1.1** adds lightning by distance (bench-tested 2026-10-04).
 
-**Planned next:**
-- **v1.2, Settings:** settings saved across reboots, an LED brightness setting, running
-  the whole bench test from the device, and a Settings menu.
+**v1.2** (in testing) adds the Settings menu, saved settings, LED levels and the Test
+Alerts page.
 
 ## Repo layout
 
@@ -133,6 +134,7 @@ n4mi-weather-sentinel/
 ├── .gitignore
 ├── README.md
 ├── images/                             (device photos used above)
+├── desk_stand/                         (3D-printable desktop stand: STL, OpenSCAD, previews)
 ├── docs/
 │   └── bench-test.md                   (full bench test: commands and expected results)
 ├── diagnostics/
@@ -155,6 +157,22 @@ n4mi-weather-sentinel/
         ├── test_nws_zone.py
         └── test_lightning_close.py
 ```
+
+## Desk stand
+
+[`desk_stand/`](desk_stand/) holds a one-piece, 3D-printable stand for the CoreS3 SE with
+the M5GO-BOTTOM3 base attached. It holds the screen tilted back 27° and leaves the side
+LEDs, ports and buttons uncovered. Two versions are included, each as a ready-to-print
+`.stl` and an editable OpenSCAD `.scad` source with a preview image:
+
+- **V1:** the original, with a 76 × 84 mm footprint;
+- **V2:** a compact version, 64 × 70 mm (about 30% less desk space), with the same
+  cradle and viewing angle.
+
+The folder's README covers fit, print settings, optional rubber-foot recesses and how to
+customize the model.
+
+![Desk stand V2 preview](desk_stand/CoreS3_Stand_V2_preview.png)
 
 ## Building the firmware
 

@@ -19,6 +19,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>   // settings saved across restarts (v1.2)
 #include <math.h>
 #include <time.h>
 #include "wifi_credentials.h"
@@ -26,7 +27,7 @@
 // Shown on the Status page. Bump this with every flashed release, and tag
 // the matching commit in GitHub with the same name (v1.0 = the build that
 // passed the Session 13-14 acceptance tests, 2026-09-30).
-const char *FIRMWARE_VERSION = "v1.1.1";  // lightning by distance (close = under 10 mi, 30-min hold)
+const char *FIRMWARE_VERSION = "v1.2";  // Settings menu, saved settings, LED levels, Test Alerts page
 
 // Forward declaration: formatCurrentTime() is defined later (grouped with
 // the rest of the NTP code, near connectWiFi()), but drawNowPage() above
@@ -52,7 +53,6 @@ extern unsigned long muteUntilMillis;
 void applyAlarmVolumeImmediately();
 void toggleMute();
 void playTestTone();
-void startRunTestAlertScenario();
 String formatMuteUntil();
 
 // Power loss and LEDs (Session 15): defined near the end of the file.
@@ -64,6 +64,44 @@ void drawPowerLostPage();
 void fetchAlertHistory();
 bool isNightTimeNow();
 extern const int ALARM_VOLUME_STEP;
+
+// ---- LED levels set from Settings (v1.2) ----
+// Two user levels drive every LED state (approved in v1.2):
+//   night: every state at ledNightLevel, except an unacknowledged
+//          Critical at 4x (16 -> 64 by default, as in v1.1);
+//   day:   ledDayLevel for flashes, lightning and on-battery, half of it
+//          for steady glows and "unknown", and full 255 for unacknowledged
+//          Warning/Critical regardless.
+// Steps chosen with Dan; defaults are the v1.1 levels he approved.
+const uint8_t LED_NIGHT_STEPS[] = {8, 12, 16, 24, 32};
+const uint8_t LED_DAY_STEPS[] = {32, 48, 64, 96, 128};
+const int LED_STEP_COUNT = 5;
+uint8_t ledNightLevel = 16;
+uint8_t ledDayLevel = 64;
+// While adjusting, the LEDs show amber at the chosen level for a moment.
+unsigned long ledPreviewUntilMillis = 0;
+uint8_t ledPreviewLevel = 0;
+const unsigned long LED_PREVIEW_MS = 3000;
+
+uint8_t stepLedLevel(uint8_t current, const uint8_t *steps, int direction) {
+  int idx = 0;
+  for (int i = 0; i < LED_STEP_COUNT; i++) if (steps[i] <= current) idx = i;
+  idx += direction;
+  if (idx < 0) idx = 0;
+  if (idx >= LED_STEP_COUNT) idx = LED_STEP_COUNT - 1;
+  return steps[idx];
+}
+bool isLedStep(uint8_t v, const uint8_t *steps) {
+  for (int i = 0; i < LED_STEP_COUNT; i++) if (steps[i] == v) return true;
+  return false;
+}
+
+// Saved settings (v1.2): defined near setup(); declared here because
+// the Settings pages call them.
+void saveSettingsIfChanged();
+bool postSimulation(const char *path, const char *scenario);
+void fetchConditions();
+void fetchSimulationStatus();
 
 enum Page {
   PAGE_NOW = 0,
@@ -1510,6 +1548,9 @@ void drawStatusPage() {
 // footer and the acknowledge bar.
 const int SETTINGS_NAV_Y = 210;
 const int SETTINGS_NAV_H = 30;
+// Two-way bar (v1.2): left half BACK (or MUTE on the menu), right half DONE.
+const int SETTINGS_NAV_HALF_X = 160;
+// Three-way bar, kept only for the Alert History detail view (< BACK >).
 const int SETTINGS_NAV_PREV_X0 = 0, SETTINGS_NAV_PREV_X1 = 64;
 const int SETTINGS_NAV_DONE_X0 = 64, SETTINGS_NAV_DONE_X1 = 256;
 const int SETTINGS_NAV_NEXT_X0 = 256, SETTINGS_NAV_NEXT_X1 = 320;
@@ -1525,13 +1566,19 @@ const int SETTINGS_STEPPER_BOX_Y_OFFSET = 12;
 const int SETTINGS_ROW_BUTTON_H = 58;   // button row height + gap
 const int SETTINGS_LABEL_ONLY_H = 18;   // a bare label line + gap
 
-// Which of the 4 Settings sub-pages is currently showing (0-3). Reset to
-// 0 every time Settings is entered via long-press, so it always starts
-// on Volume + Test Tone rather than remembering where you left off.
-int settingsSubPage = 0;
-const int SETTINGS_NUM_SUBPAGES = 5;
-// Page 5 (index 4): Alert History, added Session 12.
-const int SETTINGS_PAGE_HISTORY = 4;
+// v1.2: a Settings MENU (a grid of six tiles, approved mockup) replaces
+// the old chain of < > pages. A long-press always opens the menu; each
+// tile opens its page, and every page has the same BACK / DONE bar.
+enum SettingsView {
+  SV_MENU = 0, SV_SOUND, SV_SCREEN, SV_LEDS, SV_SCHEDULE, SV_HISTORY, SV_TEST
+};
+int settingsSubPage = SV_MENU;
+const int SETTINGS_PAGE_HISTORY = SV_HISTORY;   // name kept for "+N more"
+
+// Menu tile grid: 2 columns x 3 rows, shared by drawing and hit-testing.
+const int MENU_TILE_X[2] = {16, 164};
+const int MENU_TILE_Y[3] = {46, 100, 154};
+const int MENU_TILE_W = 140, MENU_TILE_H = 48;
 
 void drawSettingsHeader(const char *title) {
   M5.Display.fillScreen(COLOR_BG);
@@ -1539,12 +1586,6 @@ void drawSettingsHeader(const char *title) {
   M5.Display.setTextColor(COLOR_TEXT_PRIMARY, COLOR_BG);
   M5.Display.setTextSize(3);
   M5.Display.drawString(title, 16, 10);
-  char pageLabel[8];
-  snprintf(pageLabel, sizeof(pageLabel), "%d/%d", settingsSubPage + 1, SETTINGS_NUM_SUBPAGES);
-  M5.Display.setTextDatum(top_right);
-  M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
-  M5.Display.setTextSize(1);
-  M5.Display.drawString(pageLabel, 304, 14);
   M5.Display.drawFastHLine(16, 38, 288, COLOR_SEPARATOR);
 }
 
@@ -1607,6 +1648,28 @@ void drawSettingsNavBar(const char *centreLabel = "DONE") {
   M5.Display.drawString(centreLabel, (SETTINGS_NAV_DONE_X0 + SETTINGS_NAV_DONE_X1) / 2, midY);
 }
 
+// v1.2 two-way bar. leftFill != COLOR_BG gives a solid left half (the
+// menu's red MUTED state).
+void drawSettingsTwoWayBar(const String &leftLabel, uint16_t leftColor, uint16_t leftFill) {
+  M5.Display.fillRect(0, SETTINGS_NAV_Y, 320, SETTINGS_NAV_H, COLOR_BG);
+  if (leftFill != COLOR_BG) {
+    M5.Display.fillRect(0, SETTINGS_NAV_Y + 1, SETTINGS_NAV_HALF_X, SETTINGS_NAV_H - 1, leftFill);
+  }
+  M5.Display.drawFastHLine(0, SETTINGS_NAV_Y, 320, COLOR_SEPARATOR);
+  M5.Display.drawFastVLine(SETTINGS_NAV_HALF_X, SETTINGS_NAV_Y, SETTINGS_NAV_H, COLOR_SEPARATOR);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextSize(2);
+  int midY = SETTINGS_NAV_Y + SETTINGS_NAV_H / 2;
+  M5.Display.setTextColor(leftColor, leftFill);
+  M5.Display.drawString(leftLabel, SETTINGS_NAV_HALF_X / 2, midY);
+  M5.Display.setTextColor(COLOR_NWS_CLEAR_TEXT, COLOR_BG);
+  M5.Display.drawString("DONE", (SETTINGS_NAV_HALF_X + 320) / 2, midY);
+}
+
+void drawSettingsBackBar() {
+  drawSettingsTwoWayBar("< BACK", COLOR_LIGHTNING_TEXT, COLOR_BG);
+}
+
 // 12-hour "H:MM AM/PM" formatting for the schedule page -- same
 // convention as the clock and alert times elsewhere, but taking plain
 // hour/minute integers rather than a timestamp, since a schedule time
@@ -1619,66 +1682,177 @@ String formatHourMinute12(int hour, int minute) {
   return String(buf);
 }
 
-// -- Page 1: Volume + Test Tone --
-// Audio doesn't exist yet (next item after Settings), so this page is
-// visually complete per the approved mockup but genuinely inert: no
-// real volume variable exists to show or change yet. Tapping its
-// controls is logged, not acted on -- an honest placeholder, not a
-// control that silently does nothing without saying so.
-void drawSettingsVolumePage() {
+// ---- v1.2 Settings pages (approved mockup) ----
+
+// "MUTED 8:42" for the menu bar: the end time without AM/PM so it fits
+// the half-width bar; just "MUTED" if the clock isn't synced.
+String muteBarLabel() {
+  if (!timeSynced) return "MUTED";
+  long remainingSec = (long)(muteUntilMillis - millis()) / 1000;
+  if (remainingSec < 0) remainingSec = 0;
+  time_t endT = time(nullptr) + remainingSec;
+  struct tm t;
+  localtime_r(&endT, &t);
+  int h12 = t.tm_hour % 12;
+  if (h12 == 0) h12 = 12;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "MUTED %d:%02d", h12, t.tm_min);
+  return String(buf);
+}
+
+void drawMenuTile(int i, const char *label, const String &sub, uint16_t subColor) {
+  int x = MENU_TILE_X[i % 2], y = MENU_TILE_Y[i / 2];
+  M5.Display.drawRoundRect(x, y, MENU_TILE_W, MENU_TILE_H, 6, COLOR_LIGHTNING_TEXT);
+  M5.Display.setTextDatum(top_center);
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(COLOR_LIGHTNING_TEXT, COLOR_BG);
+  M5.Display.drawString(label, x + MENU_TILE_W / 2, y + 9);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(subColor, COLOR_BG);
+  M5.Display.drawString(sub, x + MENU_TILE_W / 2, y + 30);
+  M5.Display.setTextDatum(top_left);
+}
+
+void drawSettingsMenu() {
   drawSettingsHeader("Settings");
+  char buf[32];
+  snprintf(buf, sizeof(buf), "Volume %d", alarmVolume);
+  drawMenuTile(0, "SOUND", buf, COLOR_TEXT_SECONDARY);
+  snprintf(buf, sizeof(buf), "Day %d / Night %d", DAY_BRIGHTNESS, NIGHT_BRIGHTNESS);
+  drawMenuTile(1, "SCREEN", buf, COLOR_TEXT_SECONDARY);
+  snprintf(buf, sizeof(buf), "Day %d / Night %d", ledDayLevel, ledNightLevel);
+  drawMenuTile(2, "LEDS", buf, COLOR_TEXT_SECONDARY);
+  drawMenuTile(3, "SCHEDULE", formatHourMinute12(NIGHT_START_HOUR, NIGHT_START_MINUTE) + " - " +
+                              formatHourMinute12(NIGHT_END_HOUR, NIGHT_END_MINUTE), COLOR_TEXT_SECONDARY);
+  drawMenuTile(4, "HISTORY", "Last 24 hours", COLOR_TEXT_SECONDARY);
+  if (simulationActive) drawMenuTile(5, "TEST", "Test running", COLOR_LIGHTNING_TEXT);
+  else drawMenuTile(5, "TEST", "Simulations", COLOR_TEXT_SECONDARY);
+  if (audioMuted) drawSettingsTwoWayBar(muteBarLabel(), COLOR_BG, COLOR_STATUS_BAD);
+  else drawSettingsTwoWayBar("MUTE", COLOR_LIGHTNING_TEXT, COLOR_BG);
+}
+
+void drawSettingsSoundPage() {
+  drawSettingsHeader("Sound");
   drawSettingsStepperRow(46, "VOLUME", String(alarmVolume));
   drawSettingsButtonRow(46 + SETTINGS_ROW_STEPPER_H, 34, "TEST TONE", COLOR_LIGHTNING_TEXT, false, "");
-  drawSettingsNavBar();
+  drawSettingsBackBar();
 }
 
-// -- Page 2: Mute + Run Test Alert --
-// Both wired for real (Session 11). Mute turns solid red and stays
-// labelled with its end time while active, per the project's "visibly
-// indicated" rule for mute -- this is only on the Settings page itself
-// for now; a matching indicator on every other screen (the brief's own
-// flagged gap) is not yet built.
-void drawSettingsMutePage() {
-  drawSettingsHeader("Settings");
-  M5.Display.setTextDatum(top_left);
-  M5.Display.setTextColor(COLOR_LABEL, COLOR_BG);
-  M5.Display.setTextSize(1);
-  M5.Display.drawString("MUTE", 16, 46);
-  if (audioMuted) {
-    drawSettingsButtonRow(46 + SETTINGS_LABEL_ONLY_H, 34, "ON  (tap to cancel)",
-                          COLOR_STATUS_BAD, true, formatMuteUntil());
-  } else {
-    drawSettingsButtonRow(46 + SETTINGS_LABEL_ONLY_H, 34, "OFF  (tap to mute)",
-                          COLOR_NWS_CLEAR_TEXT, false, "");
-  }
-  drawSettingsButtonRow(46 + SETTINGS_LABEL_ONLY_H + SETTINGS_ROW_BUTTON_H, 34,
-                        "RUN TEST ALERT", COLOR_LIGHTNING_TEXT, false, "");
-  drawSettingsNavBar();
-}
-
-// -- Page 3: Brightness (day/night) --
-// Shows the REAL current values from the night-dimming feature (Session
-// 10) -- read-only for now. Values are the raw 0-255 setBrightness()
-// inputs, not a percentage: the hardware only has 9 real distinguishable
-// steps (confirmed from M5GFX source), so a smooth percentage would
-// imply precision that doesn't physically exist. Adjusting these is the
-// next piece of work, not this one.
-void drawSettingsBrightnessPage() {
-  drawSettingsHeader("Settings");
+// Brightness values are the raw 0-255 setBrightness() inputs, stepped
+// through the 9 real hardware levels (Session 10 finding).
+void drawSettingsScreenPage() {
+  drawSettingsHeader("Screen");
   drawSettingsStepperRow(46, "DAY BRIGHTNESS", String(DAY_BRIGHTNESS));
   drawSettingsStepperRow(46 + SETTINGS_ROW_STEPPER_H, "NIGHT BRIGHTNESS", String(NIGHT_BRIGHTNESS));
-  drawSettingsNavBar();
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+  M5.Display.setTextSize(1);
+  String note = "Night = the schedule (" + formatHourMinute12(NIGHT_START_HOUR, NIGHT_START_MINUTE) +
+                " - " + formatHourMinute12(NIGHT_END_HOUR, NIGHT_END_MINUTE) + ")";
+  M5.Display.drawString(note, 16, 176);
+  drawSettingsBackBar();
 }
 
-// -- Page 4: Night Schedule (start/end) --
-// Same story: shows the real current schedule, read-only for now.
+void drawSettingsLedPage() {
+  drawSettingsHeader("LEDs");
+  drawSettingsStepperRow(46, "DAY LEVEL", String(ledDayLevel));
+  drawSettingsStepperRow(46 + SETTINGS_ROW_STEPPER_H, "NIGHT LEVEL", String(ledNightLevel));
+  if ((long)(ledPreviewUntilMillis - millis()) > 0) {
+    M5.Display.fillRoundRect(16, 168, 288, 34, 6, COLOR_LIGHTNING_BG);
+    M5.Display.drawRoundRect(16, 168, 288, 34, 6, COLOR_LIGHTNING_BORDER);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(COLOR_LIGHTNING_TEXT, COLOR_LIGHTNING_BG);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "Showing amber at %d ...", ledPreviewLevel);
+    M5.Display.drawString(buf, 160, 185);
+  } else {
+    M5.Display.setTextDatum(top_left);
+    M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+    M5.Display.setTextSize(1);
+    M5.Display.drawString("Tap - or + to see the LEDs at that level.", 16, 172);
+    M5.Display.drawString("Critical alerts at night: 4x the night level.", 16, 186);
+  }
+  drawSettingsBackBar();
+}
+
 void drawSettingsSchedulePage() {
-  drawSettingsHeader("Settings");
+  drawSettingsHeader("Schedule");
   drawSettingsStepperRow(46, "NIGHT START",
                          formatHourMinute12(NIGHT_START_HOUR, NIGHT_START_MINUTE));
   drawSettingsStepperRow(46 + SETTINGS_ROW_STEPPER_H, "NIGHT END",
                          formatHourMinute12(NIGHT_END_HOUR, NIGHT_END_MINUTE));
-  drawSettingsNavBar();
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+  M5.Display.setTextSize(1);
+  M5.Display.drawString("Dims the screen and LEDs; quiet hours too.", 16, 176);
+  drawSettingsBackBar();
+}
+
+// ---- Test Alerts page (v1.2, approved mockup) ----
+// Runs the bench test from the device: the server's existing simulation
+// endpoints, with the status line read from GET /api/simulation/status.
+enum SimStatusLoad { SIM_STATUS_UNKNOWN, SIM_STATUS_OK };
+SimStatusLoad simStatusLoad = SIM_STATUS_UNKNOWN;
+bool simStatusActive = false;
+String simStatusScenario = "";
+int simStatusStep = 0;
+int simStatusTotal = 0;
+String simStatusDescription = "";
+
+const int TEST_BTN_ROW1_Y = 82, TEST_BTN_ROW2_Y = 128, TEST_BTN_H = 40;
+const int TEST_END_Y = 174, TEST_END_H = 30;
+const int TEST_BTN_LEFT_X = 16, TEST_BTN_RIGHT_X = 164, TEST_BTN_W = 140;
+
+const char *scenarioDisplayName(const String &s) {
+  if (s == "nws_lifecycle") return "ONE ALERT";
+  if (s == "multi_alert") return "SEVERAL ALERTS";
+  if (s == "lightning") return "LIGHTNING";
+  return "TEST";
+}
+
+void drawTestButton(int x, int y, int w, int h, const char *label, uint16_t color) {
+  M5.Display.drawRoundRect(x, y, w, h, 6, color);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(color, COLOR_BG);
+  M5.Display.drawString(label, x + w / 2, y + h / 2);
+}
+
+void drawSettingsTestPage() {
+  drawSettingsHeader("Test Alerts");
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextSize(1);
+  bool running = (simStatusLoad == SIM_STATUS_OK && simStatusActive);
+  if (simStatusLoad != SIM_STATUS_OK) {
+    M5.Display.setTextColor(COLOR_STATUS_BAD, COLOR_BG);
+    M5.Display.drawString("TEST STATUS UNKNOWN", 16, 46);
+    M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
+    M5.Display.drawString("Server not responding.", 16, 58);
+  } else if (running) {
+    char head[56];
+    snprintf(head, sizeof(head), "RUNNING: %s - STEP %d OF %d",
+             scenarioDisplayName(simStatusScenario), simStatusStep + 1, simStatusTotal);
+    M5.Display.setTextColor(COLOR_LIGHTNING_TEXT, COLOR_BG);
+    M5.Display.drawString(head, 16, 46);
+    String lines[2];
+    bool truncated = false;
+    int n = wrapInstructionText(simStatusDescription, lines, 2, 48, truncated);
+    M5.Display.setTextColor(COLOR_TEXT_PRIMARY, COLOR_BG);
+    for (int i = 0; i < n; i++) M5.Display.drawString(lines[i], 16, 58 + i * 10);
+  } else {
+    M5.Display.setTextColor(COLOR_NWS_CLEAR_TEXT, COLOR_BG);
+    M5.Display.drawString("NO TEST RUNNING", 16, 46);
+    M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
+    M5.Display.drawString("Start one below. Real alerts always end a test.", 16, 58);
+  }
+  drawTestButton(TEST_BTN_LEFT_X, TEST_BTN_ROW1_Y, TEST_BTN_W, TEST_BTN_H, "ONE ALERT", COLOR_LIGHTNING_TEXT);
+  drawTestButton(TEST_BTN_RIGHT_X, TEST_BTN_ROW1_Y, TEST_BTN_W, TEST_BTN_H, "SEVERAL", COLOR_LIGHTNING_TEXT);
+  drawTestButton(TEST_BTN_LEFT_X, TEST_BTN_ROW2_Y, TEST_BTN_W, TEST_BTN_H, "LIGHTNING", COLOR_LIGHTNING_TEXT);
+  drawTestButton(TEST_BTN_RIGHT_X, TEST_BTN_ROW2_Y, TEST_BTN_W, TEST_BTN_H, "NEXT STEP",
+                 running ? COLOR_LIGHTNING_TEXT : COLOR_TEXT_DIM);
+  drawTestButton(16, TEST_END_Y, 288, TEST_END_H, "END TEST", running ? COLOR_STATUS_BAD : COLOR_TEXT_DIM);
+  drawSettingsBackBar();
 }
 
 // ---- Settings page 5: Alert History (Session 12, approved mockup) ----
@@ -1813,7 +1987,7 @@ void drawAlertHistoryList() {
                             HISTORY_ROW_Y0 + (HISTORY_ROWS - 1) * HISTORY_ROW_H + 13);
     }
   }
-  drawSettingsNavBar("DONE");
+  drawSettingsBackBar();
 }
 
 void drawAlertHistoryDetail() {
@@ -1866,9 +2040,9 @@ void openAlertHistory() {
   renderPage(currentPage);
 }
 
-// Touch handling for page 5. Returns true if it consumed the tap. The nav
-// bar is only taken over in detail view (< > step, centre = BACK); in the
-// list view the usual Settings bar (< > pages, DONE) applies.
+// Touch handling for the History page. Returns true if it consumed the
+// tap. The nav bar is only taken over in detail view (< > step, centre =
+// BACK to the list); in the list view the usual BACK / DONE bar applies.
 bool handleAlertHistoryTouch(int x, int y) {
   if (historyDetailIndex >= 0) {
     if (y < SETTINGS_NAV_Y) return true;   // reading; ignore stray taps
@@ -1903,54 +2077,79 @@ bool handleAlertHistoryTouch(int x, int y) {
 
 void drawSettingsPage() {
   switch (settingsSubPage) {
-    case 0: drawSettingsVolumePage(); break;
-    case 1: drawSettingsMutePage(); break;
-    case 2: drawSettingsBrightnessPage(); break;
-    case 3: drawSettingsSchedulePage(); break;
-    default: drawAlertHistoryPage(); break;
+    case SV_SOUND:    drawSettingsSoundPage(); break;
+    case SV_SCREEN:   drawSettingsScreenPage(); break;
+    case SV_LEDS:     drawSettingsLedPage(); break;
+    case SV_SCHEDULE: drawSettingsSchedulePage(); break;
+    case SV_HISTORY:  drawAlertHistoryPage(); break;
+    case SV_TEST:     drawSettingsTestPage(); break;
+    default:          settingsSubPage = SV_MENU; drawSettingsMenu(); break;
   }
 }
 
-// Settings-specific touch handling. Called instead of the generic
-// tap-to-advance logic whenever currentPage == PAGE_SETTINGS -- nearly
-// the whole screen is real controls here, so "tap anywhere advances"
-// would constantly collide with them. Nav-bar taps always redraw
-// (something visibly changed); content-area taps outside the nav bar
-// are matched against each page's known hotspots and logged, since
-// nothing on those pages is wired to a real value yet.
-void handleSettingsTouch(int x, int y) {
-  if (settingsSubPage == SETTINGS_PAGE_HISTORY && handleAlertHistoryTouch(x, y)) return;
-
-  if (y >= SETTINGS_NAV_Y) {
-    if (x < SETTINGS_NAV_PREV_X1) {
-      settingsSubPage = (settingsSubPage + SETTINGS_NUM_SUBPAGES - 1) % SETTINGS_NUM_SUBPAGES;
-      Serial.printf("[settings] prev -> subpage %d\n", settingsSubPage);
-    } else if (x < SETTINGS_NAV_DONE_X1) {
-      Serial.println("[settings] DONE -- returning to Now");
-      currentPage = PAGE_NOW;
-      renderPage(currentPage);
-      return;
-    } else {
-      settingsSubPage = (settingsSubPage + 1) % SETTINGS_NUM_SUBPAGES;
-      Serial.printf("[settings] next -> subpage %d\n", settingsSubPage);
-    }
-    if (settingsSubPage == SETTINGS_PAGE_HISTORY) {
-      openAlertHistory();   // fresh fetch every time the page is entered
-      return;
-    }
+// Opens a page from the menu (or directly, e.g. "+N more" -> History).
+void openSettingsView(int view) {
+  settingsSubPage = view;
+  if (view == SV_HISTORY) { openAlertHistory(); return; }
+  if (view == SV_TEST) {
     renderPage(currentPage);
+    fetchSimulationStatus();
+  }
+  renderPage(currentPage);
+}
+
+// Leaving Settings for good (DONE, or the idle timeout).
+void closeSettings() {
+  saveSettingsIfChanged();
+  settingsSubPage = SV_MENU;
+  currentPage = PAGE_NOW;
+  renderPage(currentPage);
+}
+
+// After a Test Alerts button: refresh the status and the conditions at
+// once, rather than waiting up to 60 s for the next poll.
+void refreshAfterTestAction() {
+  fetchSimulationStatus();
+  fetchConditions();
+  lastFetchAttemptMillis = millis();
+  renderPage(currentPage);
+}
+
+// Settings touch handling (v1.2). Geometry constants are shared with the
+// drawing code above, so drawn and tappable regions can't drift apart.
+void handleSettingsTouch(int x, int y) {
+  if (settingsSubPage == SV_HISTORY && handleAlertHistoryTouch(x, y)) return;
+
+  // Bottom bar: left half = MUTE (menu) or BACK (pages); right = DONE.
+  if (y >= SETTINGS_NAV_Y) {
+    if (x >= SETTINGS_NAV_HALF_X) {
+      Serial.println("[settings] DONE -- returning to Now");
+      closeSettings();
+    } else if (settingsSubPage == SV_MENU) {
+      toggleMute();
+      renderPage(currentPage);
+    } else {
+      saveSettingsIfChanged();
+      settingsSubPage = SV_MENU;
+      renderPage(currentPage);
+    }
     return;
   }
 
-  // Content-area tap. Brightness (subpage 2) and Night Schedule
-  // (subpage 3) are wired to the real values from the night-dimming
-  // feature; Volume and Mute (subpages 0-1) have nothing real to
-  // control until audio exists, so taps there just log.
-  //
-  // Stepper box geometry matches drawSettingsStepperRow() exactly
-  // (minus box x=16..52, plus box x=268..304, box height 30 starting
-  // 8px below the row's y) -- shared numbers, not independently
-  // guessed, so drawing and hit-testing can't drift apart.
+  if (settingsSubPage == SV_MENU) {
+    for (int i = 0; i < 6; i++) {
+      int tx = MENU_TILE_X[i % 2], ty = MENU_TILE_Y[i / 2];
+      if (x >= tx && x < tx + MENU_TILE_W && y >= ty && y < ty + MENU_TILE_H) {
+        static const int views[6] = {SV_SOUND, SV_SCREEN, SV_LEDS, SV_SCHEDULE, SV_HISTORY, SV_TEST};
+        Serial.printf("[settings] menu -> view %d\n", views[i]);
+        openSettingsView(views[i]);
+        return;
+      }
+    }
+    return;
+  }
+
+  // Stepper rows: shared geometry with drawSettingsStepperRow().
   const int ROW0_Y = 46, ROW1_Y = 46 + SETTINGS_ROW_STEPPER_H;
   bool inMinusX = (x >= 16 && x < 52);
   bool inPlusX = (x >= 268 && x < 304);
@@ -1958,41 +2157,7 @@ void handleSettingsTouch(int x, int y) {
   bool inRow1Y = (y >= ROW1_Y + SETTINGS_STEPPER_BOX_Y_OFFSET && y < ROW1_Y + SETTINGS_STEPPER_BOX_Y_OFFSET + 30);
   int direction = inMinusX ? -1 : (inPlusX ? 1 : 0);
 
-  if (direction != 0 && settingsSubPage == 2) {
-    if (inRow0Y) {
-      DAY_BRIGHTNESS = stepBrightness(DAY_BRIGHTNESS, direction);
-      Serial.printf("[settings] DAY_BRIGHTNESS -> %d\n", DAY_BRIGHTNESS);
-    } else if (inRow1Y) {
-      NIGHT_BRIGHTNESS = stepBrightness(NIGHT_BRIGHTNESS, direction);
-      Serial.printf("[settings] NIGHT_BRIGHTNESS -> %d\n", NIGHT_BRIGHTNESS);
-    } else {
-      return;  // tap was in the stepper's x-range but not its y-range
-    }
-    applyCurrentBrightnessImmediately();
-    renderPage(currentPage);
-    return;
-  }
-
-  if (direction != 0 && settingsSubPage == 3) {
-    if (inRow0Y) {
-      stepScheduleTime(NIGHT_START_HOUR, NIGHT_START_MINUTE, direction);
-      Serial.printf("[settings] NIGHT_START -> %02d:%02d\n", NIGHT_START_HOUR, NIGHT_START_MINUTE);
-    } else if (inRow1Y) {
-      stepScheduleTime(NIGHT_END_HOUR, NIGHT_END_MINUTE, direction);
-      Serial.printf("[settings] NIGHT_END -> %02d:%02d\n", NIGHT_END_HOUR, NIGHT_END_MINUTE);
-    } else {
-      return;
-    }
-    renderPage(currentPage);
-    return;
-  }
-
-  // Volume (subpage 0): stepper adjusts alarmVolume directly (a flat
-  // increment, not a level table like brightness -- no hardware
-  // coarseness has been found here); TEST TONE button plays a real tone
-  // at the current volume. Box geometry matches drawSettingsButtonRow's
-  // call site exactly (y=46+64=110, h=34).
-  if (settingsSubPage == 0) {
+  if (settingsSubPage == SV_SOUND) {
     if (direction != 0 && inRow0Y) {
       int newVol = (int)alarmVolume + direction * ALARM_VOLUME_STEP;
       if (newVol < 0) newVol = 0;
@@ -2003,33 +2168,71 @@ void handleSettingsTouch(int x, int y) {
       renderPage(currentPage);
       return;
     }
-    bool inTestToneButton = (x >= 16 && x < 304 && y >= 110 && y < 144);
-    if (inTestToneButton) {
-      playTestTone();
-      return;  // no redraw needed -- nothing on screen changes
-    }
+    if (x >= 16 && x < 304 && y >= 110 && y < 144) playTestTone();
     return;
   }
 
-  // Mute (subpage 1): toggle + Run Test Alert. Box geometry matches
-  // drawSettingsMutePage's actual call sites (y=64 and y=122, h=34 each).
-  if (settingsSubPage == 1) {
-    bool inMuteButton = (x >= 16 && x < 304 && y >= 64 && y < 98);
-    bool inRunTestAlertButton = (x >= 16 && x < 304 && y >= 122 && y < 156);
-    if (inMuteButton) {
-      toggleMute();
-      renderPage(currentPage);
+  if (settingsSubPage == SV_SCREEN && direction != 0 && (inRow0Y || inRow1Y)) {
+    if (inRow0Y) DAY_BRIGHTNESS = stepBrightness(DAY_BRIGHTNESS, direction);
+    else NIGHT_BRIGHTNESS = stepBrightness(NIGHT_BRIGHTNESS, direction);
+    Serial.printf("[settings] brightness day %d night %d\n", DAY_BRIGHTNESS, NIGHT_BRIGHTNESS);
+    applyCurrentBrightnessImmediately();
+    renderPage(currentPage);
+    return;
+  }
+
+  if (settingsSubPage == SV_LEDS && direction != 0 && (inRow0Y || inRow1Y)) {
+    if (inRow0Y) {
+      ledDayLevel = stepLedLevel(ledDayLevel, LED_DAY_STEPS, direction);
+      ledPreviewLevel = ledDayLevel;
+    } else {
+      ledNightLevel = stepLedLevel(ledNightLevel, LED_NIGHT_STEPS, direction);
+      ledPreviewLevel = ledNightLevel;
+    }
+    ledPreviewUntilMillis = millis() + LED_PREVIEW_MS;
+    Serial.printf("[settings] LED levels day %d night %d (preview %d)\n",
+                  ledDayLevel, ledNightLevel, ledPreviewLevel);
+    renderPage(currentPage);
+    return;
+  }
+
+  if (settingsSubPage == SV_SCHEDULE && direction != 0 && (inRow0Y || inRow1Y)) {
+    if (inRow0Y) stepScheduleTime(NIGHT_START_HOUR, NIGHT_START_MINUTE, direction);
+    else stepScheduleTime(NIGHT_END_HOUR, NIGHT_END_MINUTE, direction);
+    Serial.printf("[settings] schedule %02d:%02d - %02d:%02d\n", NIGHT_START_HOUR,
+                  NIGHT_START_MINUTE, NIGHT_END_HOUR, NIGHT_END_MINUTE);
+    renderPage(currentPage);
+    return;
+  }
+
+  if (settingsSubPage == SV_TEST) {
+    bool running = (simStatusLoad == SIM_STATUS_OK && simStatusActive);
+    auto in = [&](int bx, int by, int bw, int bh) {
+      return x >= bx && x < bx + bw && y >= by && y < by + bh;
+    };
+    const char *startScenario = nullptr;
+    if (in(TEST_BTN_LEFT_X, TEST_BTN_ROW1_Y, TEST_BTN_W, TEST_BTN_H)) startScenario = "nws_lifecycle";
+    else if (in(TEST_BTN_RIGHT_X, TEST_BTN_ROW1_Y, TEST_BTN_W, TEST_BTN_H)) startScenario = "multi_alert";
+    else if (in(TEST_BTN_LEFT_X, TEST_BTN_ROW2_Y, TEST_BTN_W, TEST_BTN_H)) startScenario = "lightning";
+    if (startScenario) {
+      postSimulation("/api/simulation/start", startScenario);
+      refreshAfterTestAction();
       return;
     }
-    if (inRunTestAlertButton) {
-      startRunTestAlertScenario();
-      return;  // no redraw -- the new simulated data arrives on the next periodic fetch
+    if (running && in(TEST_BTN_RIGHT_X, TEST_BTN_ROW2_Y, TEST_BTN_W, TEST_BTN_H)) {
+      postSimulation("/api/simulation/advance", nullptr);
+      refreshAfterTestAction();
+      return;
+    }
+    if (running && in(16, TEST_END_Y, 288, TEST_END_H)) {
+      postSimulation("/api/simulation/stop", nullptr);
+      refreshAfterTestAction();
+      return;
     }
     return;
   }
 
-  // Anything else in the content area on these two pages: no known hotspot.
-  Serial.printf("[settings] content tap at (%d,%d) on subpage %d -- no hotspot there\n",
+  Serial.printf("[settings] content tap at (%d,%d) on view %d -- no hotspot there\n",
                 x, y, settingsSubPage);
 }
 
@@ -2500,7 +2703,7 @@ bool criticalNeedsWake() {
 }
 
 bool tapWakeAllowedHere() {
-  return !(currentPage == PAGE_SETTINGS && settingsSubPage == 2);
+  return !(currentPage == PAGE_SETTINGS && settingsSubPage == SV_SCREEN);
 }
 
 void handleNightDimming();   // defined just below
@@ -2803,7 +3006,6 @@ String formatCurrentTime() {
 #endif
 const char *SERVER_URL = SERVER_BASE_URL "/api/conditions";
 const char *ACK_URL = SERVER_BASE_URL "/api/alerts/ack";
-const char *SIMULATION_START_URL = SERVER_BASE_URL "/api/simulation/start";
 
 // PLACEHOLDERS -- tune after reading real timing from the serial log.
 const int32_t HTTP_CONNECT_TIMEOUT_MS = 2000;
@@ -3033,33 +3235,55 @@ bool ackAlert(const String &alertId) {
   return httpCode == 200;
 }
 
-// "RUN TEST ALERT" (Settings, Mute page). Same POST pattern as
-// ackAlert() -- this triggers the server's own simulation engine (built
-// Session 10) rather than faking anything device-side, so what plays
-// through the alarm engine below is the real alert-lifecycle path, just
-// fed synthetic data.
-void startRunTestAlertScenario() {
+// Test Alerts page (v1.2): drives the server's simulation endpoints, the
+// same real alert-lifecycle path the PowerShell bench test uses. Blocking,
+// with the usual short timeouts. Returns true on HTTP 200.
+bool postSimulation(const char *path, const char *scenario) {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[settings] Run Test Alert skipped -- no Wi-Fi");
-    return;
+    Serial.println("[test] skipped -- no Wi-Fi");
+    return false;
   }
-  Serial.println("[settings] Starting nws_lifecycle simulation...");
   HTTPClient http;
   http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
   http.setTimeout(HTTP_READ_TIMEOUT_MS);
-  http.begin(SIMULATION_START_URL);
+  http.begin(String(SERVER_BASE_URL) + path);
   http.addHeader("Content-Type", "application/json");
-  JsonDocument doc;
-  doc["scenario"] = "nws_lifecycle";
-  String body;
-  serializeJson(doc, body);
+  String body = "{}";
+  if (scenario) {
+    JsonDocument doc;
+    doc["scenario"] = scenario;
+    body = "";
+    serializeJson(doc, body);
+  }
   int httpCode = http.POST(body);
-  Serial.printf("[settings] simulation/start returned %d\n", httpCode);
+  Serial.printf("[test] POST %s %s -> %d\n", path, scenario ? scenario : "", httpCode);
   http.end();
-  // Deliberately not forced onto screen immediately -- the next periodic
-  // fetch (up to 60s) will pick it up naturally, same as any other
-  // conditions change. This is a bench-test convenience, not something
-  // that needs to feel instantaneous.
+  return httpCode == 200;
+}
+
+void fetchSimulationStatus() {
+  simStatusLoad = SIM_STATUS_UNKNOWN;
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+  http.setTimeout(HTTP_READ_TIMEOUT_MS);
+  http.begin(String(SERVER_BASE_URL) + "/api/simulation/status");
+  int httpCode = http.GET();
+  if (httpCode != 200) {
+    Serial.printf("[test] status GET failed: %d\n", httpCode);
+    http.end();
+    return;
+  }
+  String payload = http.getString();
+  http.end();
+  JsonDocument doc;
+  if (deserializeJson(doc, payload)) return;
+  simStatusActive = doc["active"] | false;
+  simStatusScenario = doc["scenario"] | "";
+  simStatusStep = doc["step"] | 0;
+  simStatusTotal = doc["total_steps"] | 0;
+  simStatusDescription = doc["description"] | "";
+  simStatusLoad = SIM_STATUS_OK;
 }
 
 // ---- Power loss and M5GO Bottom3 LEDs (post-v1.0 item 1, Session 15) ----
@@ -3102,11 +3326,16 @@ const LedColor LED_WHITE = {255, 255, 255};
 const LedColor LED_BLUE  = {0, 0, 255};
 
 // Levels (Dan, Session 15).
-const uint8_t LED_LEVEL_NIGHT = 16;
-const uint8_t LED_LEVEL_NIGHT_CRITICAL = 64;   // unacknowledged Critical only
-const uint8_t LED_LEVEL_DAY_DIM = 32;          // steady glow / unknown
-const uint8_t LED_LEVEL_DAY = 64;
-const uint8_t LED_LEVEL_DAY_URGENT = 255;      // unacknowledged Warning/Critical
+// Levels (v1.2): derived from the two Settings levels, see the top of
+// the file. Defaults reproduce v1.1 exactly (16 / 64 / 32 / 64 / 255).
+uint8_t ledLevelNight() { return ledNightLevel; }
+uint8_t ledLevelNightCritical() {          // unacknowledged Critical only
+  int v = ledNightLevel * 4;
+  return v > 255 ? 255 : (uint8_t)v;
+}
+uint8_t ledLevelDayDim() { return ledDayLevel / 2; }   // steady glow / unknown
+uint8_t ledLevelDay() { return ledDayLevel; }
+const uint8_t LED_LEVEL_DAY_URGENT = 255;  // unacknowledged Warning/Critical
 
 bool ledsReady = false;
 
@@ -3175,6 +3404,11 @@ bool onBatteryPower = false;
 void handleLeds() {
   if (!ledsReady) return;
   unsigned long now = millis();
+  // Settings preview (v1.2): amber at the level just chosen, briefly.
+  if ((long)(ledPreviewUntilMillis - now) > 0) {
+    writeLeds(LED_AMBER, ledPreviewLevel, true);
+    return;
+  }
   bool night = isNightTimeNow();
   NwsView v = currentNwsView();
   bool alertShown = (v == NWS_VIEW_ALERT || v == NWS_VIEW_ALERT_STALE);
@@ -3185,21 +3419,21 @@ void handleLeds() {
   if (alertShown && nwsFirstAlertNeedsAlert && sounding) {
     bool critical = (lvl == "critical");
     int flashes = critical ? 3 : (lvl == "warning" ? 2 : 1);
-    uint8_t level = night ? (critical ? LED_LEVEL_NIGHT_CRITICAL : LED_LEVEL_NIGHT)
-                          : (redTier ? LED_LEVEL_DAY_URGENT : LED_LEVEL_DAY);
+    uint8_t level = night ? (critical ? ledLevelNightCritical() : ledLevelNight())
+                          : (redTier ? LED_LEVEL_DAY_URGENT : ledLevelDay());
     writeLeds(redTier ? LED_RED : LED_AMBER, level, ledBurstOn(now, flashes));
   } else if (onBatteryPower) {
-    writeLeds(LED_BLUE, night ? LED_LEVEL_NIGHT : LED_LEVEL_DAY, (now % 3000) < 1000);
+    writeLeds(LED_BLUE, night ? ledLevelNight() : ledLevelDay(), (now % 3000) < 1000);
   } else if (alertShown) {
-    writeLeds(redTier ? LED_RED : LED_AMBER, night ? LED_LEVEL_NIGHT : LED_LEVEL_DAY_DIM, true);
+    writeLeds(redTier ? LED_RED : LED_AMBER, night ? ledLevelNight() : ledLevelDayDim(), true);
   } else if (lightningCloseNow()) {
     // Close (under 10 mi, or within the 30-minute hold): double flicker.
-    writeLeds(LED_WHITE, night ? LED_LEVEL_NIGHT : LED_LEVEL_DAY, ledFlickerOn(now));
+    writeLeds(LED_WHITE, night ? ledLevelNight() : ledLevelDay(), ledFlickerOn(now));
   } else if (currentLightningView() == LIGHTNING_ACTIVE) {
     // 10-20 mi: a single flicker every 10 s.
-    writeLeds(LED_WHITE, night ? LED_LEVEL_NIGHT : LED_LEVEL_DAY, ledSingleFlickerOn(now));
+    writeLeds(LED_WHITE, night ? ledLevelNight() : ledLevelDay(), ledSingleFlickerOn(now));
   } else if (v == NWS_VIEW_UNKNOWN || currentLightningView() == LIGHTNING_UNKNOWN) {
-    writeLeds(LED_BLUE, night ? LED_LEVEL_NIGHT : LED_LEVEL_DAY_DIM, true);
+    writeLeds(LED_BLUE, night ? ledLevelNight() : ledLevelDayDim(), true);
   } else {
     writeLeds(LED_BLUE, 0, false);   // all clear: off
   }
@@ -3314,7 +3548,7 @@ void shutdownForLowBattery() {
   M5.Display.drawString("power returns.", 160, 184);
   M5.Display.setTextDatum(top_left);
 
-  uint8_t level = isNightTimeNow() ? LED_LEVEL_NIGHT : LED_LEVEL_DAY;
+  uint8_t level = isNightTimeNow() ? ledLevelNight() : ledLevelDay();
   for (int i = 0; i < 5; i++) {
     writeLeds(LED_BLUE, level, true);
     delay(250);
@@ -3424,10 +3658,77 @@ void handlePower() {
   }
 }
 
+// ---- Settings saved across restarts (v1.2) ----
+// Stored in the ESP32's NVS flash through Preferences, namespace
+// "settings". Written only when leaving a Settings page or Settings
+// itself, and only the values that changed, to keep flash writes low.
+// Mute is deliberately NOT saved: a mute must never outlast a restart or
+// a power cut. Every value is range-checked on load, and anything
+// missing or out of range keeps its built-in default.
+Preferences settingsStore;
+
+struct SavedSettings {
+  uint8_t volume, dayBr, nightBr, ledDay, ledNight;
+  uint8_t startH, startM, endH, endM;
+};
+SavedSettings lastSaved;
+
+SavedSettings currentSettings() {
+  return {alarmVolume, DAY_BRIGHTNESS, NIGHT_BRIGHTNESS, ledDayLevel, ledNightLevel,
+          (uint8_t)NIGHT_START_HOUR, (uint8_t)NIGHT_START_MINUTE,
+          (uint8_t)NIGHT_END_HOUR, (uint8_t)NIGHT_END_MINUTE};
+}
+
+bool validTime(int h, int m) { return h >= 0 && h < 24 && m >= 0 && m < 60 && m % 15 == 0; }
+
+void loadSettings() {
+  settingsStore.begin("settings", true);   // read-only
+  int vol = settingsStore.getUChar("volume", alarmVolume);
+  int dayBr = settingsStore.getUChar("dayBr", DAY_BRIGHTNESS);
+  int nightBr = settingsStore.getUChar("nightBr", NIGHT_BRIGHTNESS);
+  int ledDay = settingsStore.getUChar("ledDay", ledDayLevel);
+  int ledNight = settingsStore.getUChar("ledNight", ledNightLevel);
+  int sh = settingsStore.getUChar("startH", NIGHT_START_HOUR);
+  int sm = settingsStore.getUChar("startM", NIGHT_START_MINUTE);
+  int eh = settingsStore.getUChar("endH", NIGHT_END_HOUR);
+  int em = settingsStore.getUChar("endM", NIGHT_END_MINUTE);
+  settingsStore.end();
+
+  alarmVolume = (uint8_t)vol;                       // any 0-255 is valid
+  if (dayBr >= 1) DAY_BRIGHTNESS = (uint8_t)dayBr;   // 0 would turn the backlight off
+  if (nightBr >= 1) NIGHT_BRIGHTNESS = (uint8_t)nightBr;
+  if (isLedStep((uint8_t)ledDay, LED_DAY_STEPS)) ledDayLevel = (uint8_t)ledDay;
+  if (isLedStep((uint8_t)ledNight, LED_NIGHT_STEPS)) ledNightLevel = (uint8_t)ledNight;
+  if (validTime(sh, sm)) { NIGHT_START_HOUR = sh; NIGHT_START_MINUTE = sm; }
+  if (validTime(eh, em)) { NIGHT_END_HOUR = eh; NIGHT_END_MINUTE = em; }
+  lastSaved = currentSettings();
+  Serial.printf("[settings] loaded: volume %d, screen %d/%d, LEDs %d/%d, night %02d:%02d-%02d:%02d\n",
+                alarmVolume, DAY_BRIGHTNESS, NIGHT_BRIGHTNESS, ledDayLevel, ledNightLevel,
+                NIGHT_START_HOUR, NIGHT_START_MINUTE, NIGHT_END_HOUR, NIGHT_END_MINUTE);
+}
+
+void saveSettingsIfChanged() {
+  SavedSettings now = currentSettings();
+  if (memcmp(&now, &lastSaved, sizeof(now)) == 0) return;
+  settingsStore.begin("settings", false);
+  if (now.volume != lastSaved.volume) settingsStore.putUChar("volume", now.volume);
+  if (now.dayBr != lastSaved.dayBr) settingsStore.putUChar("dayBr", now.dayBr);
+  if (now.nightBr != lastSaved.nightBr) settingsStore.putUChar("nightBr", now.nightBr);
+  if (now.ledDay != lastSaved.ledDay) settingsStore.putUChar("ledDay", now.ledDay);
+  if (now.ledNight != lastSaved.ledNight) settingsStore.putUChar("ledNight", now.ledNight);
+  if (now.startH != lastSaved.startH) settingsStore.putUChar("startH", now.startH);
+  if (now.startM != lastSaved.startM) settingsStore.putUChar("startM", now.startM);
+  if (now.endH != lastSaved.endH) settingsStore.putUChar("endH", now.endH);
+  if (now.endM != lastSaved.endM) settingsStore.putUChar("endM", now.endM);
+  settingsStore.end();
+  lastSaved = now;
+  Serial.println("[settings] saved");
+}
+
 void setupPower() {
   ledsReady = setupLeds();
   // Status is unknown until the first fetch: say so from the first moment.
-  if (ledsReady) writeLeds(LED_BLUE, LED_LEVEL_NIGHT, true);
+  if (ledsReady) writeLeds(LED_BLUE, ledLevelNight(), true);
   int16_t vbus = M5.Power.getVBUSVoltage();
   batteryMv = M5.Power.getBatteryVoltage();
   Serial.printf("[power] at boot: USB %d mV, battery %d mV\n", vbus, batteryMv);
@@ -3441,6 +3742,8 @@ void setup() {
 
   Serial.begin(115200);
   delay(200);
+  loadSettings();  // before the LEDs, speaker and brightness use them
+  applyAlarmVolumeImmediately();
   setupPower();   // LEDs show "status unknown" through the blocking Wi-Fi/NTP start
   Serial.println();
   Serial.println("=== Weather Sentinel -- Navigation demo ===");
@@ -3490,7 +3793,7 @@ void loop() {
     lastActivityTime = millis();
     if (currentPage != PAGE_SETTINGS) {
       currentPage = PAGE_SETTINGS;
-      settingsSubPage = 0;  // always start on Volume + Test Tone
+      settingsSubPage = SV_MENU;  // a long press always opens the menu
       Serial.println("Long-press detected -- opening Settings");
       renderPage(currentPage);
     }
@@ -3568,10 +3871,22 @@ void loop() {
   if (currentPage != PAGE_NOW &&
       (millis() - lastActivityTime >= IDLE_RETURN_MS)) {
     Serial.println("Idle timeout -- returning to Now");
-    currentPage = PAGE_NOW;
     lastActivityTime = millis();
+    if (currentPage == PAGE_SETTINGS) {
+      closeSettings();   // saves anything changed (v1.2)
+    } else {
+      currentPage = PAGE_NOW;
+      renderPage(currentPage);
+    }
+  }
+
+  // LED preview finished (v1.2): take the "Showing amber" box off.
+  static bool previewWasOn = false;
+  bool previewOn = (long)(ledPreviewUntilMillis - millis()) > 0;
+  if (previewWasOn && !previewOn && currentPage == PAGE_SETTINGS && settingsSubPage == SV_LEDS) {
     renderPage(currentPage);
   }
+  previewWasOn = previewOn;
 
   // Periodic re-fetch of real conditions. Only redraws if Now is
   // currently being shown -- doesn't interrupt whatever detail page
@@ -3582,6 +3897,9 @@ void loop() {
     fetchConditions();
     if (currentPage == PAGE_NOW) {
       renderPage(PAGE_NOW);
+    } else if (currentPage == PAGE_SETTINGS && settingsSubPage == SV_TEST) {
+      fetchSimulationStatus();   // e.g. an acknowledgement advanced the test
+      renderPage(currentPage);
     }
   }
 

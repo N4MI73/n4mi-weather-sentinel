@@ -87,6 +87,11 @@ relied on it.
   returns.
 - **Battery %** read 100% on battery at 4147 mV, so low-battery shutdown goes by voltage
   instead. The 3.5 V threshold is provisional until a battery run-down test.
+- **Saved settings (v1.2):** volume, screen brightness, LED levels and the night schedule
+  are stored in the ESP32's NVS flash with `Preferences` (namespace `settings`), written
+  only when leaving a Settings page and only for values that changed. Each value is
+  range-checked when loaded. Mute is never saved. Reflashing keeps the saved values;
+  erasing the whole flash (`pio run -t erase`) resets them to the defaults.
 - **Missing values in the server's data:** alert text fields are read with ArduinoJson's
   `| ""` default, so a JSON `null` never shows up on screen as the word "null".
 
