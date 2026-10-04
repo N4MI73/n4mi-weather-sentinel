@@ -104,28 +104,27 @@ All of this is built and confirmed on the real device:
   its clock, and refreshes immediately once it reconnects, with a reboot only as a last
   resort after 10 minutes of continuous failure.
 
-## Status: v1.1 (October 2026)
+## Status: v1.2 (October 2026)
 
-**v1.1** adds the alert LEDs and power-loss signalling (the M5GO-BOTTOM3 base). It passed
-the full bench test, a night check of the LED levels, and a battery run-down test: about
-2 hours 40 minutes on battery, a clean shutdown at 3.5 V, and an automatic restart within
-seconds of power returning.
+Releases, newest first. The Status page shows the firmware version, and each release's
+commit is tagged with the same name.
 
-**v1.0** (September 2026) passed its acceptance tests on the real device:
-- a 72-hour continuous run, with night dimming switching on schedule every night;
-- router off and on, and the server stopped and restarted — every screen showed the
-  right "unknown" or "unreachable" state and recovered by itself in under a minute;
-- a power cycle with an alert active (it came back without sounding again);
-- a full audio bench test (every tone, mute, quiet hours) and simulations of single and
-  multiple alerts.
-
-The Status page shows the firmware version, and each release's commit is tagged with the
-same name (`v1.0`, `v1.1`).
-
-**v1.1.1** adds lightning by distance (bench-tested 2026-10-04).
-
-**v1.2** (in testing) adds the Settings menu, saved settings, LED levels and the Test
-Alerts page.
+- **v1.2** (2026-10-04): the Settings menu, settings saved across restarts, LED levels
+  with a live preview, and the Test Alerts page for running the bench test from the
+  device. Bench-tested on the device.
+- **v1.1.1** (2026-10-04): lightning by distance — a single flicker for 10–20 miles; the
+  distance on screen, a double flicker and one chirp under 10 miles, held for 30 minutes.
+- **v1.1** (2026-10-03): the alert LEDs and power-loss signalling (the M5GO-BOTTOM3
+  base). Passed the full bench test, a night check of the LED levels, and a battery
+  run-down test: about 2 hours 40 minutes on battery, a clean shutdown at 3.5 V, and an
+  automatic restart within seconds of power returning.
+- **v1.0** (2026-09-30) passed its acceptance tests on the real device:
+  - a 72-hour continuous run, with night dimming switching on schedule every night;
+  - router off and on, and the server stopped and restarted — every screen showed the
+    right "unknown" or "unreachable" state and recovered by itself in under a minute;
+  - a power cycle with an alert active (it came back without sounding again);
+  - a full audio bench test (every tone, mute, quiet hours) and simulations of single
+    and multiple alerts.
 
 ## Repo layout
 
