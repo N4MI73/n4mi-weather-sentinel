@@ -235,6 +235,16 @@ LIGHTNING_WINDOW_MINUTES = 10
 LIGHTNING_FREQUENT_THRESHOLD = 3  # this many or more strikes in the
                                    # window = "frequent"; fewer = "sporadic"
 
+# Close lightning (v1.1.1, Dan, 2026-10-04): strikes under this distance
+# are "close" -- the device shows the distance, uses a stronger LED pattern
+# and chimes once. The close state is HELD for this long after the last
+# close strike, matching NWS guidance: "Wait 30 minutes after the last
+# rumble of thunder" (weather.gov/safety/lightning-outdoors). Kept in
+# memory only, like the strike window: a server restart forgets it.
+LIGHTNING_CLOSE_RADIUS_MI = 10.0
+LIGHTNING_CLOSE_HOLD_MINUTES = 30
+last_close_strike = None   # {"distance_mi": float, "at": datetime} or None
+
 # Raw list of {"distance_mi": float, "at": datetime} for strikes within
 # the filter radius, pruned to the rolling window on every read AND on
 # every new strike -- not just when a new strike arrives, since a storm
@@ -314,7 +324,11 @@ def handle_evt_strike(msg):
         return
 
     strike_time = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    global last_close_strike
     with state_lock:
+        if distance_mi < LIGHTNING_CLOSE_RADIUS_MI and (
+                last_close_strike is None or strike_time >= last_close_strike["at"]):
+            last_close_strike = {"distance_mi": distance_mi, "at": strike_time}
         recent_strikes.append({"distance_mi": distance_mi, "at": strike_time})
         _prune_recent_strikes_locked()
         kept = len(recent_strikes)
@@ -327,6 +341,35 @@ def handle_evt_strike(msg):
           f"-> {outcome} (in-window strikes now: {kept})", flush=True)
 
 
+def close_status(last_close, now=None):
+    """The "close" block of the lightning response. Active while the last
+    strike under LIGHTNING_CLOSE_RADIUS_MI is less than
+    LIGHTNING_CLOSE_HOLD_MINUTES old -- which can outlast the 10-minute
+    strike window, so the device keeps a "stay in" state after the
+    strikes stop. `last_close` is {"distance_mi", "at"} or None."""
+    now = now or datetime.now(timezone.utc)
+    block = {
+        "active": False,
+        "radius_mi": LIGHTNING_CLOSE_RADIUS_MI,
+        "hold_minutes": LIGHTNING_CLOSE_HOLD_MINUTES,
+        "last_distance_mi": None,
+        "last_strike_epoch": None,
+        "minutes_since": None,
+    }
+    if last_close is None:
+        return block
+    age = now - last_close["at"]
+    if age < timedelta(0) or age >= timedelta(minutes=LIGHTNING_CLOSE_HOLD_MINUTES):
+        return block
+    block.update({
+        "active": True,
+        "last_distance_mi": round(last_close["distance_mi"], 1),
+        "last_strike_epoch": int(last_close["at"].timestamp()),
+        "minutes_since": int(age.total_seconds() // 60),
+    })
+    return block
+
+
 def get_lightning_status():
     """Prune and classify against the current moment -- called on every
     API request, not just when a new strike arrives, so a storm that
@@ -334,6 +377,7 @@ def get_lightning_status():
     with state_lock:
         _prune_recent_strikes_locked()
         count = len(recent_strikes)
+        close = close_status(last_close_strike)
 
         if count == 0:
             return {
@@ -345,6 +389,7 @@ def get_lightning_status():
                 "strike_count_recent": 0,
                 "window_minutes": LIGHTNING_WINDOW_MINUTES,
                 "filter_radius_mi": LIGHTNING_FILTER_RADIUS_MI,
+                "close": close,
             }
 
         closest = min(s["distance_mi"] for s in recent_strikes)
@@ -363,6 +408,7 @@ def get_lightning_status():
             "strike_count_recent": count,
             "window_minutes": LIGHTNING_WINDOW_MINUTES,
             "filter_radius_mi": LIGHTNING_FILTER_RADIUS_MI,
+            "close": close,
         }
 
 
@@ -668,6 +714,8 @@ NWS_LIFECYCLE_STEPS = [
 ]
 
 LIGHTNING_SCENARIO_STEPS = [
+    # "close_strike": (distance_mi, minutes_ago) feeds the close block
+    # through the same close_status() real data uses; omitted = none.
     {
         "description": "Clear",
         "lightning": {"active": False, "level": "none", "closest_distance_mi": None,
@@ -677,24 +725,43 @@ LIGHTNING_SCENARIO_STEPS = [
         "advance_on_ack": False,
     },
     {
-        "description": "Sporadic (1 strike, 5.2 mi)",
+        "description": "Distant (1 strike, 15.0 mi) -- single white flicker, no chime",
+        "lightning": {"active": True, "level": "sporadic",
+                      "closest_distance_mi": 15.0, "strike_count_recent": 1},
+        "alerts": [],
+        "advance_on_ack": False,
+    },
+    {
+        "description": "Close (1 strike, 5.2 mi) -- distance shown, double flicker, one chime",
         "lightning": {"active": True, "level": "sporadic",
                       "closest_distance_mi": 5.2, "strike_count_recent": 1},
+        "close_strike": (5.2, 0),
         "alerts": [],
         "advance_on_ack": False,
     },
     {
-        "description": "Frequent (4 strikes, 3.5 mi)",
+        "description": "Frequent and close (4 strikes, 3.5 mi) -- no second chime",
         "lightning": {"active": True, "level": "frequent",
                       "closest_distance_mi": 3.5, "strike_count_recent": 4},
+        "close_strike": (3.5, 0),
         "alerts": [],
         "advance_on_ack": False,
     },
     {
-        "description": "Aged out of the window -- reverts to clear",
+        "description": "Strikes stopped 14 min ago -- 30-minute close hold ('wait 30')",
         "lightning": {"active": False, "level": "none", "closest_distance_mi": None,
                       "most_recent_strike_at": None, "most_recent_strike_epoch": None,
                       "strike_count_recent": 0},
+        "close_strike": (3.5, 14),
+        "alerts": [],
+        "advance_on_ack": False,
+    },
+    {
+        "description": "Hold over (31 min since the last close strike) -- clear",
+        "lightning": {"active": False, "level": "none", "closest_distance_mi": None,
+                      "most_recent_strike_at": None, "most_recent_strike_epoch": None,
+                      "strike_count_recent": 0},
+        "close_strike": (3.5, 31),
         "alerts": [],
         "advance_on_ack": False,
     },
@@ -810,6 +877,12 @@ def build_simulated_conditions(scenario_name, step_index):
         now_epoch = int(time.time())
         lightning["most_recent_strike_epoch"] = now_epoch
         lightning["most_recent_strike_at"] = iso_time(now_epoch)
+    close_spec = step.get("close_strike")
+    sim_close = None
+    if close_spec is not None:
+        dist, minutes_ago = close_spec
+        sim_close = {"distance_mi": dist, "at": now - timedelta(minutes=minutes_ago)}
+    lightning["close"] = close_status(sim_close, now)
 
     alerts = []
     for template in step.get("alerts", []):

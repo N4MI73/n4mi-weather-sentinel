@@ -84,7 +84,7 @@ that listens for this broadcast.
 
 | Method | Path | Used for |
 |---|---|---|
-| GET | `/api/conditions` | Everything the device shows: `tempest`, `lightning`, `nws` (with `alerts[]`), and a `simulation` flag. |
+| GET | `/api/conditions` | Everything the device shows: `tempest`, `lightning` (including a `close` block), `nws` (with `alerts[]`), and a `simulation` flag. |
 | POST | `/api/alerts/ack` | Body `{"id": "<alert id>"}`. Marks an alert acknowledged. |
 | GET | `/api/alerts/history` | The last 24 hours of alerts (at most 12), fetched when the device's Alert History page opens. |
 | POST | `/api/simulation/start` | Body `{"scenario": "nws_lifecycle" \| "multi_alert" \| "lightning"}`. |
@@ -100,6 +100,13 @@ that listens for this broadcast.
 3. Within a level, the newest comes first.
 
 The device acts on the first entry, so this order is the device's priority rule.
+
+**Close lightning.** A strike under 10 miles is "close". `lightning.close` reports
+whether a close strike happened in the last 30 minutes, with its distance, time and
+minutes since. The 30 minutes follow NWS guidance to wait 30 minutes after the last
+thunder, so the close state outlasts the 10-minute strike window. Both values are set in
+the code (`LIGHTNING_CLOSE_RADIUS_MI`, `LIGHTNING_CLOSE_HOLD_MINUTES`). A server restart
+forgets the last close strike, just as it forgets the strike window.
 
 **Staleness is reported, not hidden:**
 - `tempest.available` goes false after 5 minutes without an observation.
@@ -129,7 +136,8 @@ Invoke-RestMethod -Method Post -Uri "$ws/stop"
   Tornado Warning with long text → expired.
 - **`multi_alert`:** several alerts at once, exercising the ordering, colours,
   "+N more", Alert History and every tone tier.
-- **`lightning`:** clear → sporadic → frequent → clear.
+- **`lightning`:** clear → distant (15 mi) → close (5.2 mi) → frequent and close →
+  strikes stopped 14 minutes ago (the 30-minute close hold) → hold over, clear.
 
 ## Tests
 
@@ -138,6 +146,7 @@ pip install flask requests
 python server\tests\test_alert_priority.py
 python server\tests\test_alert_history.py
 python server\tests\test_nws_zone.py
+python server\tests\test_lightning_close.py
 ```
 
 Each file runs on its own with plain Python. They need no network, NAS or device, and

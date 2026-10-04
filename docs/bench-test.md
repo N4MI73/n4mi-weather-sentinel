@@ -1,7 +1,7 @@
 # Weather Sentinel — alert bench test
 
 A repeatable check of the screens, tones and LEDs using the server's built-in
-simulations. Valid from firmware **v1.1** (2026-10-03).
+simulations. Valid from firmware **v1.1.1** (2026-10-04).
 
 ## Before you start
 
@@ -41,6 +41,8 @@ To run a different scenario, replace `multi_alert` in the start command with
 - **Watch:** a single chime. Silent during quiet hours (the night schedule) and when
   muted.
 - **Advisory / Statement:** silent.
+- **Close lightning (under 10 miles):** one short rising chirp when it first comes inside
+  10 miles, once per storm. Silent during quiet hours and when muted.
 
 **LEDs** (the first matching line wins; off means all clear)
 
@@ -51,7 +53,8 @@ To run a different scenario, replace `multi_alert` in the start command with
 | Unacknowledged Watch | Amber, 1 flash per burst | 64 | 16 |
 | Power lost, on battery | Slow blue blink | 64 | 16 |
 | Alert in effect, nothing needed (acknowledged, or an Advisory or Statement) | Steady glow in the alert's colour | 32 | 16 |
-| Lightning within the radius | White double flicker every 10 s | 64 | 16 |
+| Lightning under 10 mi, or within 30 min of the last strike under 10 mi | White double flicker every 10 s | 64 | 16 |
+| Lightning 10–20 mi | White single flicker every 10 s | 64 | 16 |
 | Status unknown (server, NWS or Wi-Fi down) | Steady blue | 32 | 16 |
 | Low battery | 5 fast blue flashes, then power-off | 64 | 16 |
 | All clear | Off | — | — |
@@ -94,12 +97,17 @@ Invoke-RestMethod -Method Post -Uri "$ws/start" -ContentType "application/json" 
 Invoke-RestMethod -Method Post -Uri "$ws/start" -ContentType "application/json" -Body '{"scenario":"lightning"}'
 ```
 
-| Do | Screen | LEDs |
-|---|---|---|
-| Start | Clear | Off |
-| `advance` | Lightning nearby (sporadic) | White double flicker every 10 s |
-| `advance` | Frequent lightning | White double flicker every 10 s |
-| `advance` | Aged out; clear | Off |
+| Do | Screen | Sound | LEDs |
+|---|---|---|---|
+| Start | Clear | — | Off |
+| `advance` | Distant, 15 mi: "Lightning nearby" | None | **Single** white flicker every 10 s |
+| `advance` | Close, 5.2 mi: "Lightning 5 mi"; Lightning page "Close lightning / within 10 miles" | **One rising chirp** | **Double** white flicker every 10 s |
+| `advance` | Frequent and close, 3.5 mi: "Frequent lightning 4 mi" | None (same storm) | Double flicker |
+| `advance` | Strikes stopped 14 min ago: "Lightning 4 mi, 14m ago"; Lightning page "14 min ago, wait 30"; other pages' strip "… -- stay in" | None | Double flicker (the 30-minute hold) |
+| `advance` | Hold over: clear | — | Off |
+
+The chirp is skipped during quiet hours and when muted; the LEDs still show it. To hear it
+again, run the scenario from the start (the clear step re-arms it).
 
 When finished: `Invoke-RestMethod -Method Post -Uri "$ws/stop"`
 

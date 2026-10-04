@@ -26,7 +26,7 @@
 // Shown on the Status page. Bump this with every flashed release, and tag
 // the matching commit in GitHub with the same name (v1.0 = the build that
 // passed the Session 13-14 acceptance tests, 2026-09-30).
-const char *FIRMWARE_VERSION = "v1.1";  // LEDs + power-loss signalling; bench, night and battery tests passed 2026-10-03
+const char *FIRMWARE_VERSION = "v1.1.1";  // lightning by distance (close = under 10 mi, 30-min hold)
 
 // Forward declaration: formatCurrentTime() is defined later (grouped with
 // the rest of the NTP code, near connectWiFi()), but drawNowPage() above
@@ -106,6 +106,17 @@ long lightningMostRecentEpoch = 0;  // seconds; 0 = none/unknown
 float lightningFilterRadiusMi = 10;
 int lightningWindowMinutes = 10;
 int lightningStrikeCountRecent = 0;
+// Close lightning (v1.1.1): the server's "close" block. Close = a strike
+// under closeRadius miles; the server holds it active for 30 minutes after
+// the last close strike (NWS: wait 30 minutes after the last thunder), so
+// it can outlast the 10-minute strike window above. Missing from an older
+// server = inactive.
+bool lightningCloseActive = false;
+float lightningCloseRadiusMi = 10;
+int lightningCloseHoldMinutes = 30;
+float lightningCloseLastDistanceMi = 0;
+long lightningCloseLastEpoch = 0;
+int lightningCloseMinutesSince = 0;
 
 bool nwsAvailable = false;
 int nwsAlertCount = 0;
@@ -185,11 +196,34 @@ enum LightningView { LIGHTNING_UNKNOWN, LIGHTNING_CLEAR, LIGHTNING_ACTIVE };
 // checked against server code.
 LightningView currentLightningView() {
   bool current = backendDataFresh() && tempestAvailable;
-  if (current) return lightningActive ? LIGHTNING_ACTIVE : LIGHTNING_CLEAR;
-  if (hasEverFetchedSuccessfully && lightningActive && dataAgeMs() < LIGHTNING_HOLD_MS) {
+  bool any = lightningActive || lightningCloseActive;   // the close hold counts too
+  if (current) return any ? LIGHTNING_ACTIVE : LIGHTNING_CLEAR;
+  if (hasEverFetchedSuccessfully && any && dataAgeMs() < LIGHTNING_HOLD_MS) {
     return LIGHTNING_ACTIVE;
   }
   return LIGHTNING_UNKNOWN;
+}
+
+// Lightning by distance (v1.1.1). All three go through the freshness-aware
+// view above, so stale data never shows as close (or as clear).
+// Close strikes in the current 10-minute window:
+bool lightningCloseInWindow() {
+  return currentLightningView() == LIGHTNING_ACTIVE && lightningActive &&
+         lightningClosestDistanceMi < lightningCloseRadiusMi;
+}
+// Close now: in the window, or within the 30-minute hold after it.
+bool lightningCloseNow() {
+  return currentLightningView() == LIGHTNING_ACTIVE &&
+         (lightningCloseActive || lightningCloseInWindow());
+}
+// The hold only: no close strike in the window, but one within 30 minutes.
+bool lightningCloseHoldOnly() {
+  return lightningCloseNow() && !lightningCloseInWindow();
+}
+// Whole miles for the banner and strip; never "0 mi".
+int lightningMiles(float mi) {
+  int m = (int)lroundf(mi);
+  return m < 1 ? 1 : m;
 }
 
 String formatAgeString() {
@@ -666,11 +700,21 @@ void drawNowPage() {
 
   if (currentLightningView() == LIGHTNING_ACTIVE) {
     // "Frequent lightning nearby" is 25 characters = 300px at size 2 and
-    // overflowed this banner; "nearby" is implied by the 10-mile scope.
-    String bannerText = (lightningLevel == "frequent")
-                             ? "Frequent lightning"
-                             : "Lightning nearby";
-    drawLightningBanner(bannerText);
+    // overflowed this banner. Close lightning (v1.1.1, approved mockup)
+    // shows its distance instead; at most 23 characters fit.
+    char bannerText[32];
+    if (lightningCloseInWindow()) {
+      snprintf(bannerText, sizeof(bannerText), "%s %d mi",
+               lightningLevel == "frequent" ? "Frequent lightning" : "Lightning",
+               lightningMiles(lightningClosestDistanceMi));
+    } else if (lightningCloseHoldOnly()) {
+      snprintf(bannerText, sizeof(bannerText), "Lightning %d mi, %dm ago",
+               lightningMiles(lightningCloseLastDistanceMi), lightningCloseMinutesSince);
+    } else {
+      snprintf(bannerText, sizeof(bannerText), "%s",
+               lightningLevel == "frequent" ? "Frequent lightning" : "Lightning nearby");
+    }
+    drawLightningBanner(String(bannerText));
   }
 
   NwsView nwsView = currentNwsView();
@@ -742,7 +786,22 @@ void drawPersistentStrip() {
   } else if (currentLightningView() == LIGHTNING_ACTIVE) {
     bg = COLOR_LIGHTNING_BG;
     textColor = COLOR_LIGHTNING_TEXT;
-    msg = (lightningLevel == "frequent") ? "Frequent lightning nearby" : "Lightning nearby";
+    char lt[56];
+    if (lightningCloseInWindow()) {
+      if (lightningLevel == "frequent") {
+        snprintf(lt, sizeof(lt), "Frequent lightning, %d mi away",
+                 lightningMiles(lightningClosestDistanceMi));
+      } else {
+        snprintf(lt, sizeof(lt), "Lightning %d mi away", lightningMiles(lightningClosestDistanceMi));
+      }
+    } else if (lightningCloseHoldOnly()) {
+      snprintf(lt, sizeof(lt), "Close lightning %d mi, %d min ago -- stay in",
+               lightningMiles(lightningCloseLastDistanceMi), lightningCloseMinutesSince);
+    } else {
+      snprintf(lt, sizeof(lt), "%s",
+               lightningLevel == "frequent" ? "Frequent lightning nearby" : "Lightning nearby");
+    }
+    msg = lt;
   } else if (nwsView == NWS_VIEW_UNKNOWN) {
     // Wi-Fi is fine (checked above) but the server or NWS itself isn't
     // answering -- a different problem to troubleshoot than "Wi-Fi
@@ -954,7 +1013,18 @@ void drawLightningPage() {
     M5.Display.setTextDatum(top_left);
     M5.Display.setTextColor(COLOR_LIGHTNING_TEXT, COLOR_LIGHTNING_BG);
     M5.Display.setTextSize(2);
-    if (lightningLevel == "frequent") {
+    if (lightningCloseInWindow()) {
+      char line2[24];
+      snprintf(line2, sizeof(line2), "within %g miles", lightningCloseRadiusMi);
+      M5.Display.drawString("Close lightning", 26, 56);
+      M5.Display.drawString(line2, 26, 76);
+    } else if (lightningCloseHoldOnly()) {
+      char line2[24];
+      snprintf(line2, sizeof(line2), "%d min ago, wait %d",
+               lightningCloseMinutesSince, lightningCloseHoldMinutes);
+      M5.Display.drawString("Close lightning", 26, 56);
+      M5.Display.drawString(line2, 26, 76);
+    } else if (lightningLevel == "frequent") {
       M5.Display.drawString("Frequent lightning", 26, 56);
       M5.Display.drawString("nearby", 26, 76);
     } else {
@@ -982,19 +1052,24 @@ void drawLightningPage() {
   // Closest recent strike
   M5.Display.setTextColor(COLOR_LABEL, COLOR_BG);
   M5.Display.setTextSize(1);
-  M5.Display.drawString("CLOSEST RECENT STRIKE", 16, 108);
+  // During the close hold the distance shown is the last CLOSE strike
+  // (which may be older than the 10-minute window), labelled as such.
+  bool showHold = lightningCloseHoldOnly();
+  M5.Display.drawString(showHold ? "LAST CLOSE STRIKE" : "CLOSEST RECENT STRIKE", 16, 108);
 
   M5.Display.setTextColor(lActive ? COLOR_TEXT_PRIMARY : COLOR_TEXT_DIM, COLOR_BG);
   M5.Display.setTextSize(3);
   if (lActive) {
     char distStr[12];
-    snprintf(distStr, sizeof(distStr), "%.1f mi", lightningClosestDistanceMi);
+    snprintf(distStr, sizeof(distStr), "%.1f mi",
+             showHold ? lightningCloseLastDistanceMi : lightningClosestDistanceMi);
     M5.Display.drawString(distStr, 16, 124);
     M5.Display.setTextColor(COLOR_TEXT_SECONDARY, COLOR_BG);
     M5.Display.setTextSize(2);
     // Local time via the same NTP/TZ path as the Now-screen clock. (The
     // server's ISO string is UTC, which used to be shown as if local.)
-    M5.Display.drawString(formatEpochLocal(lightningMostRecentEpoch), 150, 130);
+    M5.Display.drawString(formatEpochLocal(showHold ? lightningCloseLastEpoch
+                                                    : lightningMostRecentEpoch), 150, 130);
   } else {
     M5.Display.drawString(lv == LIGHTNING_UNKNOWN ? "--" : "None", 16, 124);
   }
@@ -1010,8 +1085,10 @@ void drawLightningPage() {
   M5.Display.drawString(activityLabel, 16, 172);
 
   char countStr[16];
-  snprintf(countStr, sizeof(countStr), "%d strikes", lightningStrikeCountRecent);
-  M5.Display.setTextColor(lActive ? COLOR_TEXT_PRIMARY : COLOR_TEXT_DIM, COLOR_BG);
+  snprintf(countStr, sizeof(countStr), "%d strike%s", lightningStrikeCountRecent,
+           lightningStrikeCountRecent == 1 ? "" : "s");
+  M5.Display.setTextColor(lActive && lightningStrikeCountRecent > 0 ? COLOR_TEXT_PRIMARY
+                                                                   : COLOR_TEXT_DIM, COLOR_BG);
   M5.Display.setTextSize(2);
   M5.Display.drawString(lActive ? countStr
                                 : (lv == LIGHTNING_UNKNOWN ? "--" : "0 strikes"),
@@ -2806,6 +2883,17 @@ void fetchConditions() {
     lightningClosestDistanceMi = doc["lightning"]["closest_distance_mi"];
     lightningMostRecentEpoch = doc["lightning"]["most_recent_strike_epoch"] | 0L;
     lightningStrikeCountRecent = doc["lightning"]["strike_count_recent"];
+  } else {
+    lightningStrikeCountRecent = 0;
+  }
+  JsonVariant close = doc["lightning"]["close"];
+  lightningCloseActive = close["active"] | false;
+  lightningCloseRadiusMi = close["radius_mi"] | 10.0f;
+  lightningCloseHoldMinutes = close["hold_minutes"] | 30;
+  if (lightningCloseActive) {
+    lightningCloseLastDistanceMi = close["last_distance_mi"] | 0.0f;
+    lightningCloseLastEpoch = close["last_strike_epoch"] | 0L;
+    lightningCloseMinutesSince = close["minutes_since"] | 0;
   }
 
   nwsAvailable = doc["nws"]["available"];
@@ -3068,10 +3156,15 @@ bool ledBurstOn(unsigned long now, int flashes) {
   return t < (unsigned long)flashes * 400 && (t % 400) < 200;
 }
 
-// Two quick flickers every 10 s, like a strike.
+// Two quick flickers every 10 s, like a strike: close lightning.
 bool ledFlickerOn(unsigned long now) {
   unsigned long t = now % 10000;
   return t < 80 || (t >= 200 && t < 280);
+}
+
+// One flicker every 10 s: lightning 10-20 miles away (v1.1.1).
+bool ledSingleFlickerOn(unsigned long now) {
+  return now % 10000 < 80;
 }
 
 bool onBatteryPower = false;
@@ -3099,8 +3192,12 @@ void handleLeds() {
     writeLeds(LED_BLUE, night ? LED_LEVEL_NIGHT : LED_LEVEL_DAY, (now % 3000) < 1000);
   } else if (alertShown) {
     writeLeds(redTier ? LED_RED : LED_AMBER, night ? LED_LEVEL_NIGHT : LED_LEVEL_DAY_DIM, true);
-  } else if (currentLightningView() == LIGHTNING_ACTIVE) {
+  } else if (lightningCloseNow()) {
+    // Close (under 10 mi, or within the 30-minute hold): double flicker.
     writeLeds(LED_WHITE, night ? LED_LEVEL_NIGHT : LED_LEVEL_DAY, ledFlickerOn(now));
+  } else if (currentLightningView() == LIGHTNING_ACTIVE) {
+    // 10-20 mi: a single flicker every 10 s.
+    writeLeds(LED_WHITE, night ? LED_LEVEL_NIGHT : LED_LEVEL_DAY, ledSingleFlickerOn(now));
   } else if (v == NWS_VIEW_UNKNOWN || currentLightningView() == LIGHTNING_UNKNOWN) {
     writeLeds(LED_BLUE, night ? LED_LEVEL_NIGHT : LED_LEVEL_DAY_DIM, true);
   } else {
@@ -3236,6 +3333,37 @@ void shutdownForLowBattery() {
   Serial.println("[power] powering off");
   delay(100);   // let the serial line flush
   M5.Power.powerOff();
+}
+
+// ---- Close-lightning chime (v1.1.1) ----
+// One short RISING chirp when lightning first comes inside 10 miles --
+// distinct from the NWS tones (1000/1400/1800 Hz patterns) and from the
+// falling power-loss chime. Once per storm: it can sound again only after
+// the close state has fully ended (30 minutes without a close strike).
+// Follows mute and quiet hours (Dan): the double flicker still shows.
+// Never on the first data after a restart, and an "unknown" spell
+// (server or Tempest down) changes nothing, so a reboot or a server
+// restart in mid-storm can't make it chime again.
+int lightningCloseLastState = -1;   // -1 = not yet established
+
+void playCloseLightningChime() {
+  M5.Speaker.setVolume(alarmVolume);
+  M5.Speaker.tone(1200, 120, POWER_CHIME_CHANNEL, true);
+  M5.Speaker.tone(1600, 180, POWER_CHIME_CHANNEL, false);
+}
+
+void handleLightningChime() {
+  if (currentLightningView() == LIGHTNING_UNKNOWN) return;
+  int closeNow = lightningCloseNow() ? 1 : 0;
+  if (lightningCloseLastState == 0 && closeNow == 1) {
+    if (audioMuted || isNightTimeNow()) {
+      Serial.println("[lightning] close lightning -- chime skipped (muted or quiet hours)");
+    } else {
+      Serial.println("[lightning] close lightning -- chime");
+      playCloseLightningChime();
+    }
+  }
+  lightningCloseLastState = closeNow;
 }
 
 void enterBatteryPower(bool atBoot) {
@@ -3434,6 +3562,7 @@ void loop() {
   handleAlarm();
   handlePower();
   handleLeds();
+  handleLightningChime();
 
   // Idle auto-return to Now
   if (currentPage != PAGE_NOW &&

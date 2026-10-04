@@ -147,7 +147,8 @@ n4mi-weather-sentinel/
     └── tests/
         ├── test_alert_priority.py
         ├── test_alert_history.py
-        └── test_nws_zone.py
+        ├── test_nws_zone.py
+        └── test_lightning_close.py
 ```
 
 ## Building the firmware
@@ -221,6 +222,7 @@ pip install flask requests
 python server\tests\test_alert_priority.py
 python server\tests\test_alert_history.py
 python server\tests\test_nws_zone.py
+python server\tests\test_lightning_close.py
 ```
 
 Each test file runs on its own with plain Python and needs no network or device.
