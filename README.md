@@ -89,6 +89,11 @@ All of this is built and confirmed on the real device:
   flashing 3, 2 or 1 times by severity until acknowledged, then glowing steadily until the
   alert ends. White flickers mean lightning; steady blue means the device can't vouch for
   the weather. Off means all clear. They're dim at night, except for a Critical alert.
+- **Lightning by distance.** Strikes 10–20 miles away show as "Lightning nearby" and a
+  single white flicker. Under 10 miles the screen shows the distance ("Lightning 6 mi"),
+  the LEDs double-flicker, and one short chirp sounds (not during quiet hours or mute).
+  That close state lasts until 30 minutes after the last close strike, following NWS
+  advice to wait 30 minutes after the last thunder.
 - **Power-loss signalling.** If wall power drops, the base's battery keeps the device
   running: one chime, a **POWER LOST** screen saying whether alerts are still arriving,
   and a slow blue blink. On a low battery it warns, shuts down cleanly, and restarts by
@@ -115,9 +120,9 @@ seconds of power returning.
 The Status page shows the firmware version, and each release's commit is tagged with the
 same name (`v1.0`, `v1.1`).
 
+**v1.1.1** adds lightning by distance (bench-tested 2026-10-04).
+
 **Planned next:**
-- **Lightning by distance:** a quieter signal for lightning 10–20 miles away, and a
-  stronger one (with the distance on screen and a short chime) inside 10 miles.
 - **v1.2, Settings:** settings saved across reboots, an LED brightness setting, running
   the whole bench test from the device, and a Settings menu.
 
