@@ -202,6 +202,9 @@ Settings are environment variables:
 
 - `NWS_CONTACT_INFO` (required) — the identification NWS asks for, in the form
   `(appname, contact@email.com)`.
+- `NWS_ZONE_ID` (optional, default `GAC073`) — the NWS county or forecast zone to watch,
+  for example `GAC073` or `GAZ087`. Find yours at weather.gov; a malformed value is
+  logged and the default is used.
 - `LIGHTNING_FILTER_RADIUS_MI` (optional, default 10) — the lightning distance cutoff in
   miles. The compose file must pass Portainer's value through
   (`LIGHTNING_FILTER_RADIUS_MI=${LIGHTNING_FILTER_RADIUS_MI:-10}` under `environment:`),
@@ -230,8 +233,8 @@ Invoke-RestMethod -Uri "$ws/status"
 Scenarios: `nws_lifecycle` (one alert: new → acknowledged → updated → escalated to a
 Tornado Warning → expired), `multi_alert` (several alerts at once, exercising ordering,
 colours, "+N more" and every tone tier), and `lightning` (clear → sporadic → frequent →
-clear). Acknowledging on the device advances the steps that wait for it. The device's own
-**Run Test Alert** button starts `nws_lifecycle`.
+clear). Acknowledging on the device advances the steps that wait for it. The device's
+**Test** page (Settings → Test) runs any of these scenarios from the device, without a PC.
 
 **The full bench test** — every scenario step by step, with what the screen, sound and
 LEDs should do, plus the mute, server-down, power-loss, night and battery checks — is in
