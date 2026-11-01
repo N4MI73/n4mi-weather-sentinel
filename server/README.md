@@ -107,6 +107,9 @@ minutes since. The 30 minutes follow NWS guidance to wait 30 minutes after the l
 thunder, so the close state outlasts the 10-minute strike window. Both values are set in
 the code (`LIGHTNING_CLOSE_RADIUS_MI`, `LIGHTNING_CLOSE_HOLD_MINUTES`). A server restart
 forgets the last close strike, just as it forgets the strike window.
+`lightning.close.strikes_last_minute` is the number of strikes under 10 miles stamped in
+the last 60 seconds (`LIGHTNING_CLOSE_RATE_WINDOW_SEC`), present whether or not the close
+state is active. It was added for Ham Ops Console; the bedside firmware does not read it.
 
 **Staleness is reported, not hidden:**
 - `tempest.available` goes false after 5 minutes without an observation.
@@ -136,7 +139,7 @@ Invoke-RestMethod -Method Post -Uri "$ws/stop"
   Tornado Warning with long text → expired.
 - **`multi_alert`:** several alerts at once, exercising the ordering, colours,
   "+N more", Alert History and every tone tier.
-- **`lightning`:** clear → distant (15 mi) → close (5.2 mi) → frequent and close →
+- **`lightning`:** clear → distant (15 mi) → close (5.2 mi) → frequent and close (6 strikes in the last minute) →
   strikes stopped 14 minutes ago (the 30-minute close hold) → hold over, clear.
 
 ## Tests

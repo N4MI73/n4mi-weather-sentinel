@@ -97,6 +97,42 @@ reset(); strike(25.0)
 check("beyond the 20-mile filter: not tracked at all",
       srv.get_lightning_status()["active"] is False and srv.get_lightning_status()["close"]["active"] is False)
 
+print("strikes_last_minute (Ham Ops Console, 2026-11-01)")
+now = datetime.now(timezone.utc)
+check("window is 60 s", srv.LIGHTNING_CLOSE_RATE_WINDOW_SEC == 60)
+check("window shorter than the strike window",
+      srv.LIGHTNING_CLOSE_RATE_WINDOW_SEC < srv.LIGHTNING_WINDOW_MINUTES * 60)
+sl = [{"distance_mi": 3.0, "at": now - timedelta(seconds=10)},
+      {"distance_mi": 9.9, "at": now - timedelta(seconds=60)},     # edge: counted
+      {"distance_mi": 10.0, "at": now - timedelta(seconds=5)},     # at radius: not close
+      {"distance_mi": 15.0, "at": now - timedelta(seconds=5)},     # beyond 10 mi
+      {"distance_mi": 4.0, "at": now - timedelta(seconds=61)},     # too old
+      {"distance_mi": 4.0, "at": now + timedelta(seconds=5)}]      # future-stamped
+check("counts only close strikes in the last 60 s",
+      srv.count_close_strikes_last_minute(sl, now) == 2,
+      srv.count_close_strikes_last_minute(sl, now))
+check("empty list -> 0", srv.count_close_strikes_last_minute([], now) == 0)
+c = srv.close_status(None, now)
+check("inactive block still carries strikes_last_minute = 0",
+      c["strikes_last_minute"] == 0 and type(c["strikes_last_minute"]) is int)
+c = srv.close_status(None, now, 3)
+check("present even when close is inactive", c["active"] is False and c["strikes_last_minute"] == 3)
+reset()
+check("quiet: 0", srv.get_lightning_status()["close"]["strikes_last_minute"] == 0)
+for _ in range(6):
+    strike(4.0, seconds_ago=5)
+strike(15.0, seconds_ago=5)           # in the filter, beyond 10 mi
+strike(4.0, seconds_ago=120)          # close, but 2 minutes ago
+lt = srv.get_lightning_status()
+check("six close strikes in the last minute -> 6", lt["close"]["strikes_last_minute"] == 6,
+      lt["close"]["strikes_last_minute"])
+check("strike_count_recent unchanged in meaning (all 8 in window)", lt["strike_count_recent"] == 8)
+reset(); strike(4.0, seconds_ago=90)
+lt = srv.get_lightning_status()
+check("storm moved on: close still held, rate drops to 0",
+      lt["close"]["active"] is True and lt["close"]["strikes_last_minute"] == 0)
+reset()
+
 print("/api/conditions carries the close block")
 reset(); strike(6.0)
 body = client.get("/api/conditions").get_json()
@@ -105,6 +141,11 @@ check("lightning.close active", body["lightning"]["close"]["active"] is True)
 reset()
 body = client.get("/api/conditions").get_json()
 check("quiet: close present and inactive", body["lightning"]["close"]["active"] is False)
+check("quiet: strikes_last_minute = 0 in the API", body["lightning"]["close"]["strikes_last_minute"] == 0)
+reset(); strike(3.0); strike(3.0)
+body = client.get("/api/conditions").get_json()
+check("API: strikes_last_minute = 2", body["lightning"]["close"]["strikes_last_minute"] == 2)
+reset()
 
 print("lightning simulation, step by step")
 r = client.post("/api/simulation/start", json={"scenario": "lightning"})
@@ -126,6 +167,8 @@ for i, (name, active, closest, close_active, mins) in enumerate(expect):
     check(f"step {i} ({name}): close.active={close_active}", lt["close"]["active"] is close_active)
     if mins is not None:
         check(f"step {i} ({name}): minutes_since={mins}", lt["close"]["minutes_since"] == mins)
+    want = [0, 0, 1, 6, 0, 0][i]
+    check(f"step {i} ({name}): strikes_last_minute={want}", lt["close"]["strikes_last_minute"] == want)
 check("6 steps in all", len(srv.LIGHTNING_SCENARIO_STEPS) == 6)
 client.post("/api/simulation/stop")
 reset()
