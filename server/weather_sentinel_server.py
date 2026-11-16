@@ -594,6 +594,27 @@ def classify_level(props):
     return "informational"
 
 
+def alert_ends(props):
+    """When the hazard itself ends, as an ISO string, or None. Added for
+    Ham Ops Console (2026-11-16). NWS's `expires` is only when the
+    MESSAGE is due to be replaced; a live sample had 189 of 588 active
+    alerts already past `expires` (e.g. a Winter Storm Watch expiring at
+    04:00 but ending four days later). `ends` is the hazard's end; when
+    it is null, parameters.eventEndingTime[0] carries the same value if
+    present. Reported only -- it plays no part in lifecycle tracking.
+    Never raises."""
+    ends = props.get("ends")
+    if isinstance(ends, str) and ends.strip():
+        return ends
+    params = props.get("parameters")
+    if isinstance(params, dict):
+        values = params.get("eventEndingTime")
+        if isinstance(values, list) and values and isinstance(values[0], str) \
+                and values[0].strip():
+            return values[0]
+    return None
+
+
 # id -> alert record. In-memory only -- persistence across a restart is
 # separate, deliberately deferred work (see project brief).
 tracked_alerts = {}
@@ -662,6 +683,7 @@ def _sim_alert(event, level, hazard, what, instruction, acknowledged, needs_aler
         "certainty": "Observed",
         "onset": None,
         "expires": None,
+        "ends": None,
         "headline": what,
         "instruction": instruction,
         "what": what,
@@ -913,6 +935,8 @@ def build_simulated_conditions(scenario_name, step_index):
     for template in step.get("alerts", []):
         alert = dict(template)
         alert["expires"] = (now + timedelta(minutes=45)).isoformat()
+        # Later than expires, as real NWS alerts often are.
+        alert["ends"] = (now + timedelta(hours=3)).isoformat()
         alert["first_seen_at"] = now_iso
         alert["last_updated_at"] = now_iso
         alerts.append(alert)
@@ -1034,6 +1058,7 @@ def process_nws_alerts_locked(raw_props_list):
                 "certainty": props.get("certainty"),
                 "onset": props.get("onset"),
                 "expires": props.get("expires"),
+                "ends": alert_ends(props),
                 "headline": props.get("headline"),
                 "instruction": props.get("instruction"),
                 "what": what,
@@ -1075,6 +1100,9 @@ def process_nws_alerts_locked(raw_props_list):
         existing["certainty"] = props.get("certainty")
         existing["onset"] = props.get("onset")
         existing["expires"] = props.get("expires")
+        # Not part of content_changed above: a new end time alone is
+        # not treated as an update (Ham Ops Console asked for additive only).
+        existing["ends"] = alert_ends(props)
         existing["headline"] = props.get("headline")
         existing["instruction"] = props.get("instruction")
         existing["what"] = what
@@ -1236,6 +1264,9 @@ def api_conditions():
         alerts_copy = [
             {
                 **alert,
+                # Always present, even for a record persisted before
+                # `ends` existed (it fills in on the next good poll).
+                "ends": alert.get("ends"),
                 "needs_alert": (
                     alert["last_transition"] in ("new", "escalated")
                     and not alert["acknowledged"]

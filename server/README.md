@@ -101,6 +101,13 @@ that listens for this broadcast.
 
 The device acts on the first entry, so this order is the device's priority rule.
 
+**`expires` and `ends`.** Each alert carries both. `expires` is NWS's time for the
+*message* to be replaced, which is often well before the hazard is over. `ends` is when
+the hazard itself ends: NWS's `ends`, or `parameters.eventEndingTime` when `ends` is
+null, or `null` when NWS gives neither. An alert stays in the list for as long as NWS
+lists it as active, whatever either time says. `ends` was added for Ham Ops Console; the
+bedside firmware still shows "Until" from `expires`.
+
 **Close lightning.** A strike under 10 miles is "close". `lightning.close` reports
 whether a close strike happened in the last 30 minutes, with its distance, time and
 minutes since. The 30 minutes follow NWS guidance to wait 30 minutes after the last
